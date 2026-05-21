@@ -34,6 +34,13 @@ app/src-tauri/gen/
 app/ui/dist/
 backend/dist/
 
+# TypeScript build artifacts (project references emit .js/.d.ts/.tsbuildinfo)
+app/ui/**/*.tsbuildinfo
+app/ui/vite.config.js
+app/ui/vite.config.d.ts
+app/ui/vitest.config.js
+app/ui/vitest.config.d.ts
+
 # Runtime files (sidecar port, tokens, settings — never commit)
 .fly-video-automation/
 *.port
