@@ -60,6 +60,19 @@ Status legend:
 
 ---
 
+## [BLOCKED] Replace placeholder Tauri icons with real artwork
+
+- **Date:** 2026-05-21
+- **Behavior/Module:** `app/src-tauri/icons/`
+- **Why blocked:** v1 ships with **placeholder** PNG/ICNS/ICO icons (1-colour 32/128/256 px). They satisfy `tauri-build`'s validators so the app compiles, but they're not production artwork.
+- **What I tried:** Generated valid-but-trivial PNG/ICO/ICNS files so the Tauri build doesn't fail on missing icons.
+- **What I built around it:** Nothing else depends on the icon visual.
+- **What the human needs to do:**
+  1. Provide the FLY brand mark (or commission one).
+  2. Replace the 5 files under `app/src-tauri/icons/` (32×32, 128×128, 128×128@2x, `icon.icns`, `icon.ico`).
+  3. Optionally generate them with `cargo tauri icon path/to/source.png` once the source is ready.
+- **Unblocked by:** <!-- human checks this when done -->
+
 ## Notes (not blockers)
 
 - **Card-insert detection — macOS end-to-end test:** owner will leave an SD card inserted during the build window. The agent CAN and SHOULD verify detection on macOS end-to-end. (See `PROGRESS.md` → Manual tests.)

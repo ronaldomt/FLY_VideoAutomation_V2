@@ -58,3 +58,8 @@ htmlcov/
 # Logs
 logs/
 *.log
+
+# Tauri Rust build artifacts
+app/src-tauri/target/
+app/src-tauri/gen/
+app/src-tauri/Cargo.lock

@@ -1,0 +1,31 @@
+[package]
+name = "fly-video-automation"
+version = "0.1.0"
+description = "FLY Video Automation V2 — Tauri shell"
+authors = ["Ronaldo Tkotz"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "fly_video_automation_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = ["tray-icon"] }
+tauri-plugin-shell = "2.0"
+tauri-plugin-clipboard-manager = "2.0"
+tauri-plugin-opener = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.32"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process"] }
+anyhow = "1"
+thiserror = "1"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
