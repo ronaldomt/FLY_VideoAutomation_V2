@@ -11,7 +11,8 @@ import json
 from collections.abc import AsyncIterator
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
@@ -37,7 +38,10 @@ from ..behaviors.verify_upload.handler import run as verify_upload
 from ..behaviors.wipe_card.contract import WipeCardInput, WipeResult
 from ..behaviors.wipe_card.handler import run as wipe_card
 from ..context import build_default_context
+from ..integrations.composio_client import ensure_user_id
+from ..logging import get_logger
 from ..persistence.models import Phase, Session, SessionStatus
+from ..secrets import get_composio_key
 from ..settings import Settings, load_settings, save_settings
 from . import integrations_routes
 
@@ -78,21 +82,83 @@ async def setup_status() -> dict[str, bool]:
     }
 
 
+class _CompleteOAuthBody(BaseModel):
+    connection_request_id: str
+
+
 @router.post("/setup/composio/start")
 async def setup_composio_start() -> dict[str, str]:
-    # BLOCKED: see BLOCKERS.md (Composio API key + Google OAuth).
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="composio_not_yet_wired",
-    )
+    """Initiate the Composio Google OAuth flow.
+
+    Requires api_key (keychain) + auth_config_id (settings) to already be set.
+    Returns {auth_url, connection_request_id} — the frontend opens auth_url in a
+    browser tab and passes connection_request_id back to /complete.
+    """
+    import asyncio
+
+    log = get_logger("setup.composio")
+    settings = load_settings()
+    api_key = get_composio_key()
+    if not api_key:
+        raise HTTPException(412, detail="composio_api_key_missing")
+    if not settings.composio.auth_config_id:
+        raise HTTPException(412, detail="composio_auth_config_id_missing")
+    user_id = ensure_user_id(settings)
+    try:
+        from composio import ComposioToolSet
+
+        toolset = ComposioToolSet(api_key=api_key, entity_id=user_id)
+        conn_req = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: toolset.initiate_connection(
+                integration_id=settings.composio.auth_config_id,
+                entity_id=user_id,
+            ),
+        )
+    except Exception as exc:
+        log.error("composio_oauth_initiate_failed", error=str(exc))
+        raise HTTPException(502, detail=f"composio_oauth_initiate_failed: {exc}") from exc
+    if not conn_req.redirectUrl:
+        raise HTTPException(502, detail="composio_no_redirect_url")
+    log.info("composio_oauth_initiated", connection_id=conn_req.connectedAccountId)
+    return {
+        "auth_url": conn_req.redirectUrl,
+        "connection_request_id": conn_req.connectedAccountId,
+    }
 
 
 @router.post("/setup/composio/complete")
-async def setup_composio_complete() -> dict[str, bool]:
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="composio_not_yet_wired",
-    )
+async def setup_composio_complete(body: _CompleteOAuthBody) -> dict[str, bool]:
+    """Verify the Composio connection is ACTIVE and persist the connection_id.
+
+    The frontend calls this after the user completes OAuth in the browser.
+    Returns {ok: true} on success; 409 if the connection is not yet active.
+    """
+    import asyncio
+
+    log = get_logger("setup.composio")
+    settings = load_settings()
+    api_key = get_composio_key()
+    if not api_key:
+        raise HTTPException(412, detail="composio_api_key_missing")
+    user_id = ensure_user_id(settings)
+    try:
+        from composio import ComposioToolSet
+
+        toolset = ComposioToolSet(api_key=api_key, entity_id=user_id)
+        account = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: toolset.get_connected_account(id=body.connection_request_id),
+        )
+    except Exception as exc:
+        log.error("composio_connection_check_failed", error=str(exc))
+        raise HTTPException(502, detail=f"composio_connection_check_failed: {exc}") from exc
+    if account.status != "ACTIVE":
+        raise HTTPException(409, detail=f"connection_not_yet_active: {account.status}")
+    settings.composio.connection_id = body.connection_request_id
+    save_settings(settings)
+    log.info("composio_oauth_complete", connection_id=body.connection_request_id)
+    return {"ok": True}
 
 
 # ── customers ────────────────────────────────────────────────────────────────

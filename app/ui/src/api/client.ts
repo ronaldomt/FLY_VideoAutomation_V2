@@ -8,6 +8,7 @@ import type {
   CardDetected,
   ComposioKeyInput,
   ComposioPingResult,
+  ComposioStartResult,
   ComposioStatus,
   ListTodayCustomersOutput,
   SessionOut,
@@ -60,8 +61,13 @@ export const api = {
   putSettings: (settings: Settings) =>
     request<Settings>("/settings", { method: "PUT", body: JSON.stringify(settings) }),
   setupStatus: () => request<SetupStatus>("/setup/status"),
-  startComposio: () => request<{ auth_url: string }>("/setup/composio/start", { method: "POST" }),
-  completeComposio: () => request<{ ok: boolean }>("/setup/composio/complete", { method: "POST" }),
+  startComposio: () =>
+    request<ComposioStartResult>("/setup/composio/start", { method: "POST" }),
+  completeComposio: (connectionRequestId: string) =>
+    request<{ ok: boolean }>("/setup/composio/complete", {
+      method: "POST",
+      body: JSON.stringify({ connection_request_id: connectionRequestId }),
+    }),
   composioStatus: () => request<ComposioStatus>("/integrations/composio/status"),
   setComposioKey: (input: ComposioKeyInput) =>
     request<ComposioStatus>("/integrations/composio/key", {

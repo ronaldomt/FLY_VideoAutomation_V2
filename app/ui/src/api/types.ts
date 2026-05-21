@@ -167,6 +167,11 @@ export interface SetupStatus {
   local_root_set: boolean;
 }
 
+export interface ComposioStartResult {
+  auth_url: string;
+  connection_request_id: string;
+}
+
 export interface StartSessionInput {
   customer_name: string;
   customer_phone?: string | null;
