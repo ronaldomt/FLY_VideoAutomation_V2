@@ -15,9 +15,17 @@
     upload → verify against MockDrive + FakeFfmpeg
 - [x] All §10 HTTP endpoints wired (SSE on `/sessions/:id/events`)
 
-## In progress
+- [x] Frontend skeleton: Vite + React + TS + Tailwind + routing
+  - React 18 + Vite + Tailwind + Zustand + TanStack Query + React Router
+  - Typed sidecar HTTP client with `X-Sidecar-Token` auth
+  - SSE subscriber for `/sessions/:id/events`
+  - vite build green; vitest green (1 type-shape smoke test)
+- [x] Frontend pages with mocked data
+  - `/` Idle, `/session/:id?` Session (stepper Customer→Destination→Ingest→Done),
+    `/settings` (4 sub-tabs per §12), `/setup` wizard, `/logs` viewer
+  - All pages reachable via hamburger menu; no global modals
 
-- [ ] Frontend skeleton: Vite + React + TS + Tailwind + routing
+## In progress
 - [ ] Frontend pages with mocked data
 - [ ] Tauri shell + disk watcher + sidecar spawner
 - [ ] Wire Composio behind `COMPOSIO_LIVE` feature flag
