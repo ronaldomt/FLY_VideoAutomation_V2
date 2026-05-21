@@ -35,12 +35,20 @@ Status legend:
 - **Date:** 2026-05-21
 - **Behavior/Module:** `behaviors/list_today_customers`, `resolve_drive_folder`, `upload_to_drive`, `make_share_link`
 - **Why blocked:** Google OAuth consent must be granted interactively by the school's account owner in a browser. Cannot be automated.
-- **What I tried:** Built `/setup/composio/start` endpoint that returns a Composio-issued auth URL and `/setup/composio/complete` to finalize once the redirect callback fires.
-- **What I built around it:** Setup wizard step that opens the auth URL in the default browser and polls `/setup/status`. Real OAuth path is dormant until the API key blocker is resolved.
+- **What I built:**
+  - `POST /setup/composio/start` — calls `ComposioToolSet.initiate_connection(integration_id=auth_config_id)`, returns `{auth_url, connection_request_id}`. Frontend opens auth_url in a new browser tab.
+  - `POST /setup/composio/complete` — accepts `{connection_request_id}`, calls `toolset.get_connected_account(id=...)`, verifies status == "ACTIVE", persists `connection_id` to settings. `google_connected` becomes true automatically.
+  - `LiveCalendarClient.list_events()` — real `GOOGLECALENDAR_EVENTS_LIST` call. Active when `COMPOSIO_LIVE=1` env var is set.
+  - `LiveDriveClient` — folder operations + file upload via Composio actions. Same `COMPOSIO_LIVE=1` gate.
+  - Setup wizard step 2: interactive "Connect Google" button, shows prerequisite checklist, opens auth URL, "Verify connection" confirm flow, error/retry states.
 - **What the human needs to do:**
-  1. After Composio API key is set, run the first-run Setup wizard.
-  2. Click **Connect Google** → complete consent in the browser using the school's Google account.
-  3. Confirm the connection by returning to the app.
+  1. Complete Blocker #1 (API key + auth_config_id saved and validated).
+  2. Open Settings → Integrations, confirm "✓ API key" and auth config ID are set.
+  3. Open Setup (hamburger menu → Setup), go to step 2 "Connect Composio + Google".
+  4. Click **Connect Google** — a browser tab opens with the Google authorization page.
+  5. Sign in with the school's Google account and grant the requested scopes.
+  6. Return to the app and click **I've authorized — verify connection**.
+  7. The step should show a green checkmark once verified.
 - **Unblocked by:** <!-- human checks this when done -->
 
 ## [BLOCKED] Confirm Google Calendar ID
