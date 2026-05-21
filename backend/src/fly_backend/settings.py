@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Final
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 SETTINGS_DIR: Final[Path] = Path.home() / ".fly-video-automation"
 SETTINGS_FILE: Final[Path] = SETTINGS_DIR / "settings.json"
@@ -52,8 +52,28 @@ class UiSettings(BaseModel):
 
 
 class ComposioSettings(BaseModel):
+    """Composio integration settings.
+
+    The API key itself is NEVER stored here — it lives in the OS keychain
+    (see `fly_backend.secrets`). This document only records that one has been
+    set, plus the non-secret identifiers needed to reconstruct the SDK client.
+
+    `toolkit` is locked to `google_super` for v1 (single OAuth covering
+    Calendar + Drive + future Google scopes); keep the field so we can later
+    support split toolkits without a settings migration.
+    """
+
     api_key_set: bool = False
-    google_connected: bool = False
+    auth_config_id: str | None = None
+    connection_id: str | None = None
+    user_id: str | None = None
+    toolkit: str = "google_super"
+    last_validated_at: str | None = None  # ISO 8601, set by /integrations/composio/ping
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def google_connected(self) -> bool:
+        return self.api_key_set and bool(self.connection_id)
 
 
 class Settings(BaseModel):

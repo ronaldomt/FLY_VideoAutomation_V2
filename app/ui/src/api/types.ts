@@ -130,8 +130,35 @@ export interface Settings {
   };
   composio: {
     api_key_set: boolean;
+    auth_config_id: string | null;
+    connection_id: string | null;
+    user_id: string | null;
+    toolkit: string;
+    last_validated_at: string | null;
     google_connected: boolean;
   };
+}
+
+/** Returned by /integrations/composio/status, /key (PUT/DELETE). */
+export interface ComposioStatus {
+  api_key_set: boolean;
+  auth_config_id: string | null;
+  user_id: string | null;
+  connection_id: string | null;
+  google_connected: boolean;
+  toolkit: string;
+  last_validated_at: string | null;
+}
+
+export interface ComposioKeyInput {
+  api_key: string;
+  auth_config_id: string;
+}
+
+export interface ComposioPingResult {
+  ok: boolean;
+  validated_at: string;
+  detail?: string | null;
 }
 
 export interface SetupStatus {

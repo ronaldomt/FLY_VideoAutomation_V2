@@ -13,12 +13,21 @@ Status legend:
 - **Date:** 2026-05-21
 - **Behavior/Module:** `backend/src/fly_backend/integrations/composio_calendar.py`, `composio_drive.py`
 - **Why blocked:** Human owner must create a Composio account and generate an API key. The agent cannot complete account signup.
-- **What I tried:** Wired the integration interfaces behind a `COMPOSIO_LIVE` feature flag, defaulting OFF. Mocked integrations used in tests.
-- **What I built around it:** `integrations/composio_*.py` with clean interfaces (`list_events(date)`, `get_folder(folder_id)`, `upload_file(...)`, `create_share_permission(...)`). Mocked implementations registered when `COMPOSIO_LIVE=0`.
+- **What I built around it:**
+  - **Storage:** OS keychain via the `keyring` Python lib (macOS Keychain / Windows Credential Manager). `settings.json` records only `composio.api_key_set: bool`. Tests use an in-memory backend; the real keychain is never touched during pytest.
+  - **Toolkit:** locked to `google_super` per design decision (single auth covers Calendar + Drive + future Google scopes).
+  - **Rotation:** on every key change, the existing Google connection is cleared so OAuth re-runs (per the user decision).
+  - **Endpoints:**
+    - `GET /integrations/composio/status` — non-secret status.
+    - `PUT /integrations/composio/key` — body `{api_key, auth_config_id}`; persists key to keychain + auth_config_id to settings.
+    - `DELETE /integrations/composio/key` — wipes keychain + flags.
+    - `POST /integrations/composio/ping` — makes a real Composio SDK call to validate the key.
+  - **Settings UI:** Integrations tab has API-key + Auth-config-ID inputs, plus Save / Validate / Clear buttons; shows status indicators ("✓ API key" / "✓ Google connected") and last validation timestamp.
 - **What the human needs to do:**
-  1. Sign up at https://app.composio.dev/
-  2. Create an API key.
-  3. Provide the API key during first-run setup (Setup wizard → Integrations) OR set `COMPOSIO_API_KEY` env var.
+  1. Sign up at https://app.composio.dev/.
+  2. Create an API key (Dashboard → API Keys).
+  3. Create an Auth Config for Google (Dashboard → Auth Configs → New → Google → enable Calendar + Drive scopes); copy the auth_config_id.
+  4. Open Settings → Integrations in the app; paste both; click **Save key** then **Validate**.
 - **Unblocked by:** <!-- human checks this when done -->
 
 ## [BLOCKED] Connect school's Google account in Composio (OAuth consent)

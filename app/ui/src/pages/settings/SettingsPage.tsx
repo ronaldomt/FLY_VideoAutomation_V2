@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { api } from "@/api/client";
+import { api, SidecarError } from "@/api/client";
 import type { Settings } from "@/api/types";
 
 /**
@@ -174,16 +174,7 @@ export function SettingsPage() {
                 className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none"
               />
             </Field>
-            <div className="rounded-md border border-slate-800 p-3 text-sm">
-              <div className="text-slate-300">Composio</div>
-              <div className="mt-1 text-slate-400">
-                API key: {draft.composio.api_key_set ? "✓ set" : "—"} · Google:{" "}
-                {draft.composio.google_connected ? "✓ connected" : "—"}
-              </div>
-              <div className="mt-2 text-xs text-slate-500">
-                Connect via the first-run Setup wizard.
-              </div>
-            </div>
+            <ComposioPanel />
           </>
         ) : null}
       </div>
@@ -222,6 +213,188 @@ function Field({
       {children}
     </label>
   );
+}
+
+/**
+ * Composio integration panel.
+ *
+ * Two inputs: API key (write-only — never round-tripped from the backend)
+ * and auth_config_id (created in the operator's Composio dashboard).
+ *
+ * Saving the key:
+ * - Stores the key in the OS keychain (via the backend), not in
+ *   settings.json.
+ * - Clears any prior Google connection — the user explicitly chose
+ *   "re-auth on every key change" so this isn't accidental.
+ * - Does NOT auto-ping; the user clicks Validate to make a live call.
+ */
+function ComposioPanel() {
+  const qc = useQueryClient();
+  const status = useQuery({
+    queryKey: ["composio-status"],
+    queryFn: api.composioStatus,
+  });
+
+  const [apiKey, setApiKey] = useState("");
+  const [authConfigId, setAuthConfigId] = useState("");
+  const [feedback, setFeedback] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
+
+  useEffect(() => {
+    if (status.data?.auth_config_id) setAuthConfigId(status.data.auth_config_id);
+  }, [status.data?.auth_config_id]);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api.setComposioKey({ api_key: apiKey.trim(), auth_config_id: authConfigId.trim() }),
+    onSuccess: () => {
+      setApiKey("");
+      setFeedback({ kind: "ok", msg: "Saved. Key is in the OS keychain." });
+      qc.invalidateQueries({ queryKey: ["composio-status"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e) => {
+      const detail =
+        e instanceof SidecarError ? extractDetail(e.body) : String(e);
+      setFeedback({ kind: "err", msg: `Save failed: ${detail}` });
+    },
+  });
+
+  const clear = useMutation({
+    mutationFn: () => api.clearComposioKey(),
+    onSuccess: () => {
+      setApiKey("");
+      setFeedback({ kind: "ok", msg: "Cleared." });
+      qc.invalidateQueries({ queryKey: ["composio-status"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
+
+  const ping = useMutation({
+    mutationFn: () => api.pingComposio(),
+    onSuccess: (r) => {
+      setFeedback({
+        kind: "ok",
+        msg: `Validated at ${new Date(r.validated_at).toLocaleTimeString()}.`,
+      });
+      qc.invalidateQueries({ queryKey: ["composio-status"] });
+    },
+    onError: (e) => {
+      const detail =
+        e instanceof SidecarError ? extractDetail(e.body) : String(e);
+      setFeedback({ kind: "err", msg: `Validate failed: ${detail}` });
+    },
+  });
+
+  const s = status.data;
+  const canSave =
+    apiKey.trim().length >= 8 && authConfigId.trim().length >= 4 && !save.isPending;
+  const canPing = !!s?.api_key_set && !!s?.auth_config_id && !ping.isPending;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-slate-800 p-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium text-slate-200">Composio</div>
+          <div className="text-xs text-slate-500">
+            Toolkit: {s?.toolkit ?? "google_super"} (single auth covers Calendar + Drive)
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-xs">
+          <span className={s?.api_key_set ? "text-emerald-400" : "text-slate-500"}>
+            {s?.api_key_set ? "✓" : "○"} API key
+          </span>
+          <span className={s?.google_connected ? "text-emerald-400" : "text-slate-500"}>
+            {s?.google_connected ? "✓" : "○"} Google connected
+          </span>
+        </div>
+      </div>
+
+      <Field
+        label="API key"
+        description={
+          s?.api_key_set
+            ? "A key is currently stored in the OS keychain. Paste a new one to rotate (existing Google OAuth will be cleared)."
+            : "Create an API key at app.composio.dev → API Keys. Pasting it here stores it in the OS keychain — never in settings.json."
+        }
+      >
+        <input
+          type="password"
+          autoComplete="off"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder={s?.api_key_set ? "•••••••• (paste to rotate)" : "ck_live_…"}
+          className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm placeholder:text-slate-600 focus:border-emerald-500 focus:outline-none"
+        />
+      </Field>
+
+      <Field
+        label="Auth config ID"
+        description="From your Composio dashboard → Auth Configs. Create one for Google with Calendar + Drive scopes; paste its ID here."
+      >
+        <input
+          type="text"
+          value={authConfigId}
+          onChange={(e) => setAuthConfigId(e.target.value)}
+          placeholder="ac_…"
+          className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-sm placeholder:text-slate-600 focus:border-emerald-500 focus:outline-none"
+        />
+      </Field>
+
+      <div className="flex flex-wrap items-center gap-2 pt-1">
+        <button
+          type="button"
+          disabled={!canSave}
+          onClick={() => save.mutate()}
+          className="rounded-md bg-emerald-500 px-3 py-1.5 text-sm font-medium text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+        >
+          {save.isPending ? "Saving…" : "Save key"}
+        </button>
+        <button
+          type="button"
+          disabled={!canPing}
+          onClick={() => ping.mutate()}
+          className="rounded-md border border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-900 disabled:opacity-40"
+        >
+          {ping.isPending ? "Validating…" : "Validate"}
+        </button>
+        <button
+          type="button"
+          disabled={!s?.api_key_set || clear.isPending}
+          onClick={() => {
+            if (confirm("Remove the Composio API key from the keychain?")) clear.mutate();
+          }}
+          className="rounded-md border border-rose-700/60 px-3 py-1.5 text-sm text-rose-300 hover:bg-rose-950/40 disabled:opacity-40"
+        >
+          Clear key
+        </button>
+        {s?.last_validated_at ? (
+          <span className="ml-auto text-xs text-slate-500">
+            Last validated {new Date(s.last_validated_at).toLocaleString()}
+          </span>
+        ) : null}
+      </div>
+
+      {feedback ? (
+        <div
+          className={`rounded-md border px-3 py-2 text-xs ${
+            feedback.kind === "ok"
+              ? "border-emerald-700/40 bg-emerald-950/30 text-emerald-200"
+              : "border-rose-700/50 bg-rose-950/30 text-rose-200"
+          }`}
+        >
+          {feedback.msg}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function extractDetail(body: unknown): string {
+  if (body && typeof body === "object" && "detail" in body) {
+    const d = (body as { detail: unknown }).detail;
+    return typeof d === "string" ? d : JSON.stringify(d);
+  }
+  return String(body);
 }
 
 function Toggle({

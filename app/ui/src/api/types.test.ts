@@ -24,7 +24,15 @@ describe("Settings type", () => {
       card_wipe: { enabled: false, require_verification: true },
       whatsapp: { auto_open_when_phone_present: true },
       ui: { auto_focus_on_card_insert: true },
-      composio: { api_key_set: false, google_connected: false },
+      composio: {
+        api_key_set: false,
+        auth_config_id: null,
+        connection_id: null,
+        user_id: null,
+        toolkit: "google_super",
+        last_validated_at: null,
+        google_connected: false,
+      },
     };
     expect(s.calendar_id).toBe("primary");
   });

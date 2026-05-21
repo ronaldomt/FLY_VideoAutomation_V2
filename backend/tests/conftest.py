@@ -17,6 +17,25 @@ os.environ.setdefault("FLY_WRITE_RUNTIME_FILE", "0")
 os.environ.setdefault("COMPOSIO_LIVE", "0")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_keychain() -> Iterator[None]:
+    """Replace the OS keychain with an in-memory backend for every test.
+
+    Without this, calls to `secrets.set_composio_key()` would touch the
+    real macOS Keychain / Windows Credential Manager — exactly the kind of
+    side effect a test suite must never have.
+    """
+    from fly_backend import secrets as secrets_mod
+
+    backend = secrets_mod.InMemoryBackend()
+    original = secrets_mod._backend
+    secrets_mod.set_backend(backend)
+    try:
+        yield
+    finally:
+        secrets_mod.set_backend(original)
+
+
 @pytest.fixture
 def settings_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolate settings/runtime files to tmp_path so tests don't leak to $HOME."""

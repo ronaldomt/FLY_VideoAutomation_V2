@@ -39,8 +39,10 @@ from ..behaviors.wipe_card.handler import run as wipe_card
 from ..context import build_default_context
 from ..persistence.models import Phase, Session, SessionStatus
 from ..settings import Settings, load_settings, save_settings
+from . import integrations_routes
 
 router = APIRouter()
+router.include_router(integrations_routes.router)
 
 
 def _ctx():  # type: ignore[no-untyped-def]

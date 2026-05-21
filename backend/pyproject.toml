@@ -17,6 +17,7 @@ dependencies = [
     "ffmpeg-python>=0.2.0",
     "composio-core>=0.5",
     "python-multipart>=0.0.9",
+    "keyring>=25.4",
 ]
 
 [project.optional-dependencies]

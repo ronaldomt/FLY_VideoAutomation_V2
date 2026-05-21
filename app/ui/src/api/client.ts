@@ -6,6 +6,9 @@
 import { getSidecarConfig } from "./config";
 import type {
   CardDetected,
+  ComposioKeyInput,
+  ComposioPingResult,
+  ComposioStatus,
   ListTodayCustomersOutput,
   SessionOut,
   SessionSummary,
@@ -59,6 +62,16 @@ export const api = {
   setupStatus: () => request<SetupStatus>("/setup/status"),
   startComposio: () => request<{ auth_url: string }>("/setup/composio/start", { method: "POST" }),
   completeComposio: () => request<{ ok: boolean }>("/setup/composio/complete", { method: "POST" }),
+  composioStatus: () => request<ComposioStatus>("/integrations/composio/status"),
+  setComposioKey: (input: ComposioKeyInput) =>
+    request<ComposioStatus>("/integrations/composio/key", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  clearComposioKey: () =>
+    request<ComposioStatus>("/integrations/composio/key", { method: "DELETE" }),
+  pingComposio: () =>
+    request<ComposioPingResult>("/integrations/composio/ping", { method: "POST" }),
   customersToday: (on?: string) =>
     request<ListTodayCustomersOutput>(`/customers/today${on ? `?on=${on}` : ""}`),
   cardsCurrent: () => request<CardDetected | null>("/cards/current"),
