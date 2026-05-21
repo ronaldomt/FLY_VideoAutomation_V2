@@ -5,11 +5,18 @@
 ## Done
 
 - [x] Repo `git init` + initial scaffolding per CLAUDE.md §21
+- [x] Backend skeleton: pyproject + FastAPI `/health` + settings layer
+- [x] Backend behaviors with mocked integrations + unit tests
+  - 10 behaviors (detect_card, list_today_customers, resolve_drive_folder,
+    start_session, copy_media, extract_frames, upload_to_drive, verify_upload,
+    make_share_link, wipe_card) each in `behaviors/<name>/{contract,handler,tests}.py`
+  - 56 unit + integration tests pass; ruff clean
+  - start_session integration test covers orchestrator → copy → extract →
+    upload → verify against MockDrive + FakeFfmpeg
+- [x] All §10 HTTP endpoints wired (SSE on `/sessions/:id/events`)
 
 ## In progress
 
-- [ ] Backend skeleton: pyproject + FastAPI `/health` + settings layer
-- [ ] Backend behaviors with mocked integrations + unit tests
 - [ ] Frontend skeleton: Vite + React + TS + Tailwind + routing
 - [ ] Frontend pages with mocked data
 - [ ] Tauri shell + disk watcher + sidecar spawner

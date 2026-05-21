@@ -43,6 +43,7 @@ def _now() -> datetime:
 class Session(SQLModel, table=True):
     id: str = Field(primary_key=True)
     customer_name: str
+    customer_phone: str | None = None
     drive_folder_url: str
     drive_folder_id: str | None = None
     source_mount_path: str
