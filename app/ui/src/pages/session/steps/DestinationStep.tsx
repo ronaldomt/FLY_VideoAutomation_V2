@@ -10,7 +10,21 @@ export function DestinationStep({ sessionKey }: { sessionKey: string }) {
   const patch = useSessionStore((s) => s.patch);
   const setStep = useSessionStore((s) => s.setStep);
   const lastCard = useCardStore((s) => s.lastCard);
+  const setCard = useCardStore((s) => s.setCard);
   const [url, setUrl] = useState(slice?.driveFolderUrl ?? "");
+
+  // Poll cards/current so the step works even when the user arrived here
+  // before inserting the card (e.g. via the "New session" button on IdlePage).
+  const cardPoll = useQuery({
+    queryKey: ["card-current"],
+    queryFn: api.cardsCurrent,
+    refetchInterval: 2_000,
+  });
+  useEffect(() => {
+    if (cardPoll.data && cardPoll.data.mount_path !== lastCard?.mount_path) {
+      setCard(cardPoll.data);
+    }
+  }, [cardPoll.data, lastCard?.mount_path, setCard]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
