@@ -1,29 +1,36 @@
-"""Google Drive via Composio.
+"""Google Drive via Composio (correct action names + v3 upload flow).
 
-Mock by default. `LiveDriveClient` activates when `COMPOSIO_LIVE=1` env var is
-set and the Google connection is established (api_key + connection_id in settings).
-
-Note on large files: Composio's `GOOGLEDRIVE_UPLOAD_FILE` action wraps the
-standard Drive API upload and is suitable for the file sizes in scope (up to
-~200 GB per session). v2 may switch to resumable chunked uploads via httpx for
-better progress reporting; the `DriveClient` protocol is designed to allow that
-swap without touching behaviors.
+Action mapping verified 2026-05-22:
+  GOOGLEDRIVE_GET_FILE_INFO       → NOT FOUND
+    Replaced: validate via GOOGLEDRIVE_LIST_FILES, name via GOOGLEDRIVE_FIND_FOLDER
+  GOOGLEDRIVE_LIST_FILES_IN_FOLDER→ NOT FOUND
+    Replaced: GOOGLEDRIVE_LIST_FILES (query: '<id>' in parents)
+  GOOGLEDRIVE_CREATE_FOLDER       → EXISTS; field is folder_name (not name)
+  GOOGLEDRIVE_UPLOAD_FILE         → EXISTS but requires v3 presigned URL flow
+    Flow: POST /api/v3/files/upload/request → PUT presigned_url → execute with s3key
+  GOOGLEDRIVE_SHARE_FILE          → NOT FOUND
+    Replaced: URL construction only (folder creator controls sharing in My Drive)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ..errors import BehaviorError
+import requests as _requests
+
+from ..errors import BehaviorError, IntegrationError
 
 if TYPE_CHECKING:
     from ..settings import Settings
 
 _FOLDER_ID_RE = re.compile(r"(?:/folders/|[?&]id=)([A-Za-z0-9_\-]{10,})")
+_COMPOSIO_V2 = "https://backend.composio.dev/api/v2"
+_COMPOSIO_V3 = "https://backend.composio.dev/api/v3"
 
 
 def parse_folder_id(url_or_id: str) -> str:
@@ -95,8 +102,6 @@ class MockDriveClient:
         return sub_id
 
     async def upload_file(self, parent_id: str, local: Path) -> UploadResult:
-        import hashlib
-
         data = local.read_bytes() if local.exists() else b""
         md5 = hashlib.md5(data).hexdigest()
         result = UploadResult(
@@ -116,10 +121,10 @@ class MockDriveClient:
 
 
 class LiveDriveClient:
-    """Real Composio-backed Google Drive client.
+    """Real Google Drive client via Composio.
 
-    All blocking Composio SDK calls are dispatched to a thread-pool executor
-    so they don't block the asyncio event loop.
+    Uses the v2 execute endpoint for metadata operations and the v3 presigned
+    upload flow for file uploads (Composio's v1 upload API was removed).
     """
 
     def __init__(self, api_key: str, user_id: str, connection_id: str) -> None:
@@ -127,85 +132,154 @@ class LiveDriveClient:
         self.user_id = user_id
         self.connection_id = connection_id
 
-    def _toolset(self):  # type: ignore[no-untyped-def]  # pragma: no cover
-        from composio import ComposioToolSet
-
-        return ComposioToolSet(api_key=self.api_key, entity_id=self.user_id)
+    # ── Composio action execution (v2) ──────────────────────────────────────
 
     def _exec(self, action: str, params: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover
-        ts = self._toolset()
-        result: dict[str, Any] = ts.execute_action(
+        from .composio_client import composio_execute
+
+        result = composio_execute(
+            api_key=self.api_key,
+            connection_id=self.connection_id,
+            entity_id=self.user_id,
             action=action,
-            params=params,
-            connected_account_id=self.connection_id,
+            input_params=params,
         )
         return result.get("data") or {}
 
+    # ── File upload via v3 presigned URL flow ────────────────────────────────
+
+    def _upload_via_composio(  # pragma: no cover
+        self, local: Path, parent_folder_id: str
+    ) -> str:
+        """Upload a local file to Drive using the v3 presigned URL mechanism.
+
+        Returns the Drive file_id of the uploaded file.
+        """
+        data = local.read_bytes()
+        md5 = hashlib.md5(data).hexdigest()
+        mime = _guess_mime(local.name)
+
+        # Step 1: Request a presigned upload URL from Composio v3
+        try:
+            resp1 = _requests.post(
+                f"{_COMPOSIO_V3}/files/upload/request",
+                headers={"x-api-key": self.api_key},
+                json={
+                    "md5": md5,
+                    "toolkit_slug": "googlesuper",
+                    "tool_slug": "GOOGLEDRIVE_UPLOAD_FILE",
+                    "filename": local.name,
+                    "mimetype": mime,
+                },
+                timeout=15,
+            )
+            resp1.raise_for_status()
+        except _requests.HTTPError as exc:
+            raise IntegrationError(f"composio_upload_request_failed: {exc.response.text}") from exc
+        upload_meta = resp1.json()
+        s3key: str = upload_meta["key"]
+        presigned_url: str = upload_meta["new_presigned_url"]
+
+        # Step 2: PUT file content to the presigned URL (Cloudflare R2)
+        try:
+            resp2 = _requests.put(
+                presigned_url,
+                data=data,
+                headers={"Content-Type": mime},
+                timeout=max(60, len(data) // (256 * 1024)),  # ~1s per 256KB
+            )
+            resp2.raise_for_status()
+        except _requests.HTTPError as exc:
+            raise IntegrationError(f"composio_s3_upload_failed: {exc.response.text}") from exc
+
+        # Step 3: Execute Drive upload action with the s3key
+        result = self._exec(
+            "GOOGLEDRIVE_UPLOAD_FILE",
+            {
+                "file_to_upload": {"name": local.name, "mimetype": mime, "s3key": s3key},
+                "parent_folder_id": parent_folder_id,
+            },
+        )
+        file_id: str = result.get("id", "")
+        if not file_id:
+            raise IntegrationError(f"composio_upload_no_file_id: {result}")
+        return file_id
+
+    # ── DriveClient interface ────────────────────────────────────────────────
+
     async def get_folder(self, folder_id: str) -> DriveFolder:  # pragma: no cover
-        data = await asyncio.get_event_loop().run_in_executor(
+        """Validate folder exists and return its metadata.
+
+        Uses LIST_FILES to confirm access, then FIND_FOLDER to get the name.
+        """
+        # Validate access — this raises IntegrationError if folder is inaccessible
+        await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: self._exec("GOOGLEDRIVE_GET_FILE_INFO", {"file_id": folder_id}),
+            lambda: self._exec(
+                "GOOGLEDRIVE_LIST_FILES",
+                {"query": f"'{folder_id}' in parents and trashed=false"},
+            ),
         )
-        return DriveFolder(
-            id=folder_id,
-            name=data.get("name", folder_id),
-            path=data.get("name", folder_id),
-        )
+        # Best-effort: find the folder name by scanning FIND_FOLDER results
+        name = folder_id
+        try:
+            folders_data = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self._exec(
+                    "GOOGLEDRIVE_FIND_FOLDER",
+                    {"query": "mimeType='application/vnd.google-apps.folder' and trashed=false"},
+                ),
+            )
+            for f in folders_data.get("files") or []:
+                if f.get("id") == folder_id:
+                    name = f.get("name", folder_id)
+                    break
+        except Exception:
+            pass
+        return DriveFolder(id=folder_id, name=name, path=name)
 
     async def ensure_subfolder(self, parent_id: str, name: str) -> str:  # pragma: no cover
         """Return id of existing subfolder named `name`, creating it if absent."""
-        # Check if it already exists
         data = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
-                "GOOGLEDRIVE_LIST_FILES_IN_FOLDER",
-                {"folder_id": parent_id, "query": f"name='{name}' and mimeType='application/vnd.google-apps.folder'"},
+                "GOOGLEDRIVE_LIST_FILES",
+                {
+                    "query": (
+                        f"'{parent_id}' in parents"
+                        f" and name='{name}'"
+                        f" and mimeType='application/vnd.google-apps.folder'"
+                        f" and trashed=false"
+                    )
+                },
             ),
         )
-        files = data.get("files") or []
-        for f in files:
+        for f in data.get("files") or []:
             if f.get("name") == name:
                 return str(f["id"])
-        # Create it
         created = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
                 "GOOGLEDRIVE_CREATE_FOLDER",
-                {"name": name, "parent_folder_id": parent_id},
+                {"folder_name": name, "parent_folder_id": parent_id},
             ),
         )
-        return str(created.get("id") or created.get("folder_id", ""))
+        return str(created.get("id") or "")
 
     async def upload_file(self, parent_id: str, local: Path) -> UploadResult:  # pragma: no cover
-        import hashlib
-
         data = local.read_bytes()
         md5 = hashlib.md5(data).hexdigest()
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self._exec(
-                "GOOGLEDRIVE_UPLOAD_FILE",
-                {
-                    "file_path": str(local),
-                    "name": local.name,
-                    "parent_folder_id": parent_id,
-                },
-            ),
+        file_id = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._upload_via_composio(local, parent_id)
         )
-        file_id: str = result.get("id") or result.get("file_id", "")
-        return UploadResult(
-            file_id=file_id,
-            name=local.name,
-            size=local.stat().st_size,
-            md5=md5,
-        )
+        return UploadResult(file_id=file_id, name=local.name, size=len(data), md5=md5)
 
     async def list_files(self, folder_id: str) -> list[DriveFile]:  # pragma: no cover
         data = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
-                "GOOGLEDRIVE_LIST_FILES_IN_FOLDER",
-                {"folder_id": folder_id},
+                "GOOGLEDRIVE_LIST_FILES",
+                {"query": f"'{folder_id}' in parents and trashed=false"},
             ),
         )
         out = []
@@ -214,28 +288,34 @@ class LiveDriveClient:
                 DriveFile(
                     id=f.get("id", ""),
                     name=f.get("name", ""),
-                    size=int(f.get("size", 0)),
+                    size=int(f.get("size") or 0),
                     md5=f.get("md5Checksum", ""),
                 )
             )
         return out
 
     async def create_share_link(self, folder_id: str) -> str:  # pragma: no cover
-        await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: self._exec(
-                "GOOGLEDRIVE_SHARE_FILE",
-                {"file_id": folder_id, "role": "reader", "type": "anyone"},
-            ),
-        )
+        """Return the sharing URL for the folder.
+
+        In My Drive (non-Shared Drive), the folder's creator controls sharing.
+        The operator pastes a shareable URL, so it's already accessible.
+        """
         return f"https://drive.google.com/drive/folders/{folder_id}?usp=sharing"
 
 
-def build_drive_client(settings: Settings) -> DriveClient:
-    import os
+def _guess_mime(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    return {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+    }.get(ext, "application/octet-stream")
 
-    live = os.environ.get("COMPOSIO_LIVE", "0") == "1"
-    if live and settings.composio.google_connected and settings.composio.connection_id:
+
+def build_drive_client(settings: "Settings") -> DriveClient:
+    if settings.composio.google_connected and settings.composio.connection_id:
         from ..secrets import get_composio_key
 
         api_key = get_composio_key()
