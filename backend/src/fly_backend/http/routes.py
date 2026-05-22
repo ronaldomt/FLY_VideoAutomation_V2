@@ -86,15 +86,21 @@ class _CompleteOAuthBody(BaseModel):
     connection_request_id: str
 
 
+_COMPOSIO_V3 = "https://backend.composio.dev/api/v3"
+
+
 @router.post("/setup/composio/start")
 async def setup_composio_start() -> dict[str, str]:
-    """Initiate the Composio Google OAuth flow.
+    """Initiate the Composio Google OAuth flow via the v3 API.
 
-    Requires api_key (keychain) + auth_config_id (settings) to already be set.
-    Returns {auth_url, connection_request_id} — the frontend opens auth_url in a
-    browser tab and passes connection_request_id back to /complete.
+    The Composio SDK's initiate_connection() uses the deprecated v1 endpoint;
+    POST /api/v3/connected_accounts/link accepts the ac_* auth_config_id
+    that users copy from the Composio dashboard.
+
+    Returns {auth_url, connection_request_id} — the frontend opens auth_url
+    in a browser tab and passes connection_request_id back to /complete.
     """
-    import asyncio
+    import httpx
 
     log = get_logger("setup.composio")
     settings = load_settings()
@@ -105,26 +111,27 @@ async def setup_composio_start() -> dict[str, str]:
         raise HTTPException(412, detail="composio_auth_config_id_missing")
     user_id = ensure_user_id(settings)
     try:
-        from composio import ComposioToolSet
-
-        toolset = ComposioToolSet(api_key=api_key, entity_id=user_id)
-        conn_req = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: toolset.initiate_connection(
-                integration_id=settings.composio.auth_config_id,
-                entity_id=user_id,
-            ),
-        )
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.post(
+                f"{_COMPOSIO_V3}/connected_accounts/link",
+                headers={"x-api-key": api_key},
+                json={"auth_config_id": settings.composio.auth_config_id, "user_id": user_id},
+            )
+            resp.raise_for_status()
+            data: dict = resp.json()
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text
+        log.error("composio_oauth_initiate_failed", error=body)
+        raise HTTPException(502, detail=f"composio_oauth_initiate_failed: {body}") from exc
     except Exception as exc:
         log.error("composio_oauth_initiate_failed", error=str(exc))
         raise HTTPException(502, detail=f"composio_oauth_initiate_failed: {exc}") from exc
-    if not conn_req.redirectUrl:
+    redirect_url = data.get("redirect_url")
+    if not redirect_url:
         raise HTTPException(502, detail="composio_no_redirect_url")
-    log.info("composio_oauth_initiated", connection_id=conn_req.connectedAccountId)
-    return {
-        "auth_url": conn_req.redirectUrl,
-        "connection_request_id": conn_req.connectedAccountId,
-    }
+    conn_id = data.get("connected_account_id", "")
+    log.info("composio_oauth_initiated", connection_id=conn_id)
+    return {"auth_url": redirect_url, "connection_request_id": conn_id}
 
 
 @router.post("/setup/composio/complete")
@@ -134,31 +141,93 @@ async def setup_composio_complete(body: _CompleteOAuthBody) -> dict[str, bool]:
     The frontend calls this after the user completes OAuth in the browser.
     Returns {ok: true} on success; 409 if the connection is not yet active.
     """
-    import asyncio
+    import httpx
 
     log = get_logger("setup.composio")
     settings = load_settings()
     api_key = get_composio_key()
     if not api_key:
         raise HTTPException(412, detail="composio_api_key_missing")
-    user_id = ensure_user_id(settings)
     try:
-        from composio import ComposioToolSet
-
-        toolset = ComposioToolSet(api_key=api_key, entity_id=user_id)
-        account = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: toolset.get_connected_account(id=body.connection_request_id),
-        )
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(
+                f"{_COMPOSIO_V3}/connected_accounts/{body.connection_request_id}",
+                headers={"x-api-key": api_key},
+            )
+            resp.raise_for_status()
+            data: dict = resp.json()
+    except httpx.HTTPStatusError as exc:
+        body_text = exc.response.text
+        log.error("composio_connection_check_failed", error=body_text)
+        raise HTTPException(502, detail=f"composio_connection_check_failed: {body_text}") from exc
     except Exception as exc:
         log.error("composio_connection_check_failed", error=str(exc))
         raise HTTPException(502, detail=f"composio_connection_check_failed: {exc}") from exc
-    if account.status != "ACTIVE":
-        raise HTTPException(409, detail=f"connection_not_yet_active: {account.status}")
-    settings.composio.connection_id = body.connection_request_id
+    status = data.get("status", "")
+    connection_id = body.connection_request_id
+
+    if status != "ACTIVE":
+        # The given connection may still be initializing; look for the most
+        # recent ACTIVE connection for this user as a fallback (e.g. when the
+        # browser completes OAuth but the returned ID had a race condition).
+        try:
+            user_id = ensure_user_id(settings)
+            async with httpx.AsyncClient(timeout=15) as http2:
+                list_resp = await http2.get(
+                    f"{_COMPOSIO_V3}/connected_accounts",
+                    headers={"x-api-key": api_key},
+                    params={"user_id": user_id, "toolkit_slug": "googlesuper"},
+                )
+                list_resp.raise_for_status()
+                items = list_resp.json().get("items", [])
+            active = [i for i in items if i.get("status") == "ACTIVE"]
+            if active:
+                # Most recently updated active connection wins.
+                active.sort(key=lambda i: i.get("updated_at", ""), reverse=True)
+                connection_id = active[0]["id"]
+                status = "ACTIVE"
+        except Exception:
+            pass  # Keep original status; will 409 below.
+
+    if status != "ACTIVE":
+        raise HTTPException(409, detail=f"connection_not_yet_active: {status}")
+
+    # Resolve the v1 UUID — action execution (execute_action) uses the v1/v2
+    # API which requires a UUID, not the ca_* id returned by v3.
+    uuid = await _resolve_v1_uuid(api_key, settings.composio.user_id or "", connection_id)
+    settings.composio.connection_id = uuid or connection_id
     save_settings(settings)
-    log.info("composio_oauth_complete", connection_id=body.connection_request_id)
+    log.info("composio_oauth_complete", connection_id=settings.composio.connection_id)
     return {"ok": True}
+
+
+async def _resolve_v1_uuid(api_key: str, user_id: str, ca_id: str) -> str | None:
+    """Map a v3 ca_* connected account ID to the v1 UUID needed for execute_action.
+
+    The Composio SDK's action execution endpoints (v1/v2) require UUID-format
+    connection IDs; the v3 OAuth flow returns ca_* IDs. This function fetches
+    the v1 connected accounts list and returns the most recent ACTIVE UUID.
+    Returns None if the lookup fails (caller falls back to the ca_* id).
+    """
+    import httpx
+
+    _COMPOSIO_V1 = "https://backend.composio.dev/api/v1"
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(
+                f"{_COMPOSIO_V1}/connectedAccounts",
+                headers={"x-api-key": api_key},
+                params={"user_uuid": user_id, "pageSize": 50},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+        active = [i for i in items if i.get("status") == "ACTIVE"]
+        if not active:
+            return None
+        active.sort(key=lambda i: i.get("updatedAt", ""), reverse=True)
+        return str(active[0]["id"])
+    except Exception:
+        return None
 
 
 # ── customers ────────────────────────────────────────────────────────────────
@@ -173,12 +242,16 @@ async def customers_today(on: date | None = None) -> ListTodayCustomersOutput:
 _LAST_CARD: dict[str, object] | None = None
 
 
+def _set_last_card(value: dict[str, object] | None) -> None:
+    global _LAST_CARD
+    _LAST_CARD = value
+
+
 @router.post("/cards/detected")
 async def cards_detected(payload: DetectCardInput) -> dict[str, object]:
-    global _LAST_CARD
     detected = await detect_card(payload, _ctx())
-    _LAST_CARD = detected.model_dump(mode="json")
-    return _LAST_CARD
+    _set_last_card(detected.model_dump(mode="json"))
+    return _LAST_CARD  # type: ignore[return-value]
 
 
 @router.get("/cards/current")

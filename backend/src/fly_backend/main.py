@@ -10,6 +10,7 @@ See CLAUDE.md §5, §10.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 from collections.abc import AsyncIterator
@@ -47,9 +48,32 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_logging(LOG_LEVEL)
     log = get_logger("fly_backend.lifespan")
     log.info("sidecar_starting", token_set=bool(RUN_TOKEN))
+
+    from .behaviors.detect_card.contract import DetectCardInput
+    from .behaviors.detect_card.handler import run as _detect_card
+    from .context import build_default_context
+    from .disk_poller import set_card_callback, start_disk_poller
+    from .http.routes import _set_last_card
+
+    async def _on_card(mount: object, label: str | None) -> None:
+        from pathlib import Path
+        mount_path = Path(str(mount))
+        payload = DetectCardInput(
+            mount_path=mount_path,
+            volume_id=str(mount_path),
+            label=label,
+        )
+        ctx = build_default_context()
+        detected = await _detect_card(payload, ctx)
+        _set_last_card(detected.model_dump(mode="json"))
+
+    set_card_callback(_on_card)
+    poller_task = asyncio.create_task(start_disk_poller())
+
     try:
         yield
     finally:
+        poller_task.cancel()
         log.info("sidecar_stopping")
         clear_runtime_file()
 
