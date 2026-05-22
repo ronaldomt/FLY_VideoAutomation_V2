@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/api/client";
 import { useSessionStore } from "@/state/session-store";
 
@@ -7,23 +7,16 @@ export function IngestStep({ sessionKey }: { sessionKey: string }) {
   const appendProgress = useSessionStore((s) => s.appendProgress);
   const patch = useSessionStore((s) => s.patch);
   const setStep = useSessionStore((s) => s.setStep);
-  const subscribed = useRef(false);
+  const [sseError, setSseError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (subscribed.current || !slice?.serverSessionId) return;
-    subscribed.current = true;
-    const teardown = api.subscribeEvents(slice.serverSessionId, {
+    if (!slice?.serverSessionId) return;
+    return api.subscribeEvents(slice.serverSessionId, {
       onProgress: (e) => appendProgress(sessionKey, e),
       onVerification: (e) => patch(sessionKey, { verification: e }),
-      onDone: () => {
-        // Move to Done once verification arrives.
-        setStep(sessionKey, "done");
-      },
-      onError: () => {
-        // SSE error — leave UI; user can retry from Done step.
-      },
+      onDone: () => setStep(sessionKey, "done"),
+      onError: (e) => setSseError(`stream_error: ${(e as ErrorEvent).message || "connection failed"}`),
     });
-    return teardown;
   }, [slice?.serverSessionId, sessionKey, appendProgress, patch, setStep]);
 
   const events = slice?.progress ?? [];
@@ -44,6 +37,11 @@ export function IngestStep({ sessionKey }: { sessionKey: string }) {
           Don't unmount the card. You can leave the room — uploads finish in the background.
         </p>
       </header>
+      {sseError ? (
+        <div className="rounded-md border border-rose-700/50 bg-rose-950/30 p-3 text-sm text-rose-200">
+          {sseError}
+        </div>
+      ) : null}
       <ul className="flex flex-col gap-3">
         {phases.map((p) => {
           const s = byPhase[p];
