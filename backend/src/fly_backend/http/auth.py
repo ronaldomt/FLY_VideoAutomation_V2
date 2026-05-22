@@ -23,9 +23,15 @@ class SidecarAuth:
 
     def verify(self, request: Request) -> None:
         # `/health` is exempt: shell hits it before reading the runtime file.
-        if request.url.path == "/health":
+        # OPTIONS is exempt: CORS preflight never carries custom headers (browser spec).
+        if request.url.path == "/health" or request.method == "OPTIONS":
             return
-        provided = request.headers.get(TOKEN_HEADER, "")
+        # EventSource (SSE) cannot send custom headers — accept token via query param too.
+        provided = (
+            request.headers.get(TOKEN_HEADER)
+            or request.query_params.get("token")
+            or ""
+        )
         if not hmac.compare_digest(provided, self.token):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
