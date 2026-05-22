@@ -25,10 +25,12 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
             raise BehaviorError("session_missing_drive_folder_id")
         local_root = Path(session.local_folder)
         parent_id = session.drive_folder_id
+        customer_name = session.customer_name
 
-    # Ensure Videos/ + Fotos/ subfolders exist on Drive.
-    videos_remote = await ctx.drive.ensure_subfolder(parent_id, "Videos")
-    fotos_remote = await ctx.drive.ensure_subfolder(parent_id, "Fotos")
+    # Create TD_<Customer>/ inside the destination folder, then Videos/ + Fotos/ under it.
+    customer_remote = await ctx.drive.ensure_subfolder(parent_id, f"TD_{customer_name}")
+    videos_remote = await ctx.drive.ensure_subfolder(customer_remote, "Videos")
+    fotos_remote = await ctx.drive.ensure_subfolder(customer_remote, "Fotos")
     bucket_map = {"Videos": videos_remote, "Fotos": fotos_remote}
 
     with ctx.db.session() as db:
@@ -56,7 +58,7 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
         nonlocal completed
         bucket = record.relative_path.split("/", 1)[0]
         remote_parent = bucket_map.get(bucket)
-        if remote_parent is None:
+        if not remote_parent:
             raise BehaviorError(f"unknown_bucket_in_record: {record.relative_path}")
         local_path = local_root / record.relative_path
         if not local_path.exists():

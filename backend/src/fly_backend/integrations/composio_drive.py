@@ -146,15 +146,96 @@ class LiveDriveClient:
         )
         return result.get("data") or {}
 
-    # ── File upload via v3 presigned URL flow ────────────────────────────────
+    # ── OAuth token (for direct Drive API uploads) ───────────────────────────
+
+    def _get_oauth_token(self) -> str | None:  # pragma: no cover
+        """Try to get the real Google OAuth token from the Composio SDK.
+
+        Returns None if the token is unavailable or masked ("REDACTED").
+        Falls back gracefully — callers should use the Composio R2 path when None.
+        """
+        try:
+            from composio import Composio as _Composio
+
+            client = _Composio(api_key=self.api_key)
+            account = client.connected_accounts.get(self.connection_id)
+            token = account.connectionParams.access_token
+            if token and token != "REDACTED":
+                return token
+        except Exception:
+            pass
+        return None
+
+    # ── Direct Drive API resumable upload ────────────────────────────────────
+
+    def _upload_direct(  # pragma: no cover
+        self, local: Path, parent_folder_id: str, token: str
+    ) -> str:
+        """Upload directly to Google Drive via the resumable upload API.
+
+        Avoids the Composio R2 hop (local → R2 → Drive) so the file is only
+        uploaded once (local → Drive). ~2-3× faster for large files.
+        Returns the Drive file_id.
+        """
+        data = local.read_bytes()
+        mime = _guess_mime(local.name)
+        upload_timeout = max(120, len(data) // (256 * 1024))
+
+        # Initiate the resumable session
+        try:
+            init_resp = _requests.post(
+                "https://www.googleapis.com/upload/drive/v3/files",
+                params={"uploadType": "resumable"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "X-Upload-Content-Type": mime,
+                    "X-Upload-Content-Length": str(len(data)),
+                },
+                json={
+                    "name": local.name,
+                    "parents": [parent_folder_id],
+                },
+                timeout=15,
+            )
+            init_resp.raise_for_status()
+        except _requests.HTTPError as exc:
+            raise IntegrationError(f"drive_resumable_init_failed: {exc.response.text}") from exc
+
+        upload_url: str = init_resp.headers["Location"]
+
+        # Upload the file content
+        try:
+            up_resp = _requests.put(
+                upload_url,
+                data=data,
+                headers={"Content-Type": mime},
+                timeout=upload_timeout,
+            )
+            up_resp.raise_for_status()
+        except _requests.HTTPError as exc:
+            raise IntegrationError(f"drive_resumable_upload_failed: {exc.response.text}") from exc
+
+        file_id: str = up_resp.json().get("id", "")
+        if not file_id:
+            raise IntegrationError(f"drive_resumable_no_file_id: {up_resp.text}")
+        return file_id
+
+    # ── File upload (direct if token available, Composio R2 otherwise) ───────
 
     def _upload_via_composio(  # pragma: no cover
         self, local: Path, parent_folder_id: str
     ) -> str:
-        """Upload a local file to Drive using the v3 presigned URL mechanism.
+        """Upload a local file to Drive.
 
-        Returns the Drive file_id of the uploaded file.
+        Tries direct Google Drive resumable upload first (faster — single hop).
+        Falls back to Composio's v3 presigned URL flow if OAuth token is unavailable.
+        Returns the Drive file_id.
         """
+        token = self._get_oauth_token()
+        if token:
+            return self._upload_direct(local, parent_folder_id, token)
+
         data = local.read_bytes()
         md5 = hashlib.md5(data).hexdigest()
         mime = _guess_mime(local.name)
@@ -240,6 +321,8 @@ class LiveDriveClient:
 
     async def ensure_subfolder(self, parent_id: str, name: str) -> str:  # pragma: no cover
         """Return id of existing subfolder named `name`, creating it if absent."""
+        if not parent_id:
+            raise IntegrationError("ensure_subfolder: parent_id is empty")
         data = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
@@ -264,7 +347,13 @@ class LiveDriveClient:
                 {"folder_name": name, "parent_folder_id": parent_id},
             ),
         )
-        return str(created.get("id") or "")
+        folder_id = str(created.get("id") or "")
+        if not folder_id:
+            raise IntegrationError(
+                f"GOOGLEDRIVE_CREATE_FOLDER returned no id for '{name}' "
+                f"under parent '{parent_id}' — response: {created}"
+            )
+        return folder_id
 
     async def upload_file(self, parent_id: str, local: Path) -> UploadResult:  # pragma: no cover
         data = local.read_bytes()
