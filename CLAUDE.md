@@ -228,7 +228,8 @@ This is the canonical happy path. Build to this; deviations must be justified in
 │
 └── docs/
     ├── design/                       ← Open Design / Impecable exports
-    └── decisions/                    ← ADRs as we deviate
+    ├── decisions/                    ← ADRs as we deviate
+    └── solutions/                    ← documented solutions (bugs, best practices, workflow patterns); YAML frontmatter indexed by module, tags, problem_type
 ```
 
 ---
