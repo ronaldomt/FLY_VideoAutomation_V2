@@ -9,6 +9,8 @@ describe("Settings type", () => {
   it("accepts the documented default shape", () => {
     const s: Settings = {
       local_root: null,
+      drive_base_folder_url: null,
+      drive_base_folder_id: null,
       drive_recent_folders: [],
       calendar_id: "primary",
       extraction: {

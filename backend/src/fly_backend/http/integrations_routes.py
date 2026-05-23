@@ -59,20 +59,44 @@ async def put_key(payload: ComposioKeyInput) -> ComposioStatus:
     """Store the Composio API key in the OS keychain and the (non-secret)
     auth_config_id in settings.
 
-    **Side effects** (per CLAUDE.md §17 — user decision: re-auth on every key
-    change):
-    - clears any existing `connection_id` so the Google OAuth flow re-runs.
-    - clears `last_validated_at` so the UI shows the validation is stale.
+    After saving the key, tries to auto-recover an existing active connection
+    for this install's user_id from Composio so the operator doesn't need to
+    re-run the OAuth flow when rotating keys within the same workspace.
     """
+    import httpx
+
     log = get_logger("integrations.composio")
     settings = load_settings()
     set_composio_key(payload.api_key)
     settings.composio.api_key_set = True
     settings.composio.auth_config_id = payload.auth_config_id
-    settings.composio.connection_id = None
     settings.composio.last_validated_at = None
+
+    # Try to recover an existing ACTIVE connection so key rotation is seamless.
+    recovered_id: str | None = None
+    user_id = settings.composio.user_id
+    if user_id:
+        try:
+            _COMPOSIO_V1 = "https://backend.composio.dev/api/v1"
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.get(
+                    f"{_COMPOSIO_V1}/connectedAccounts",
+                    headers={"x-api-key": payload.api_key},
+                    params={"user_uuid": user_id, "pageSize": 50},
+                )
+                resp.raise_for_status()
+                items = resp.json().get("items", [])
+            active = [i for i in items if i.get("status") == "ACTIVE"]
+            if active:
+                active.sort(key=lambda i: i.get("updatedAt", ""), reverse=True)
+                recovered_id = str(active[0]["id"])
+                log.info("composio_connection_auto_recovered", connection_id=recovered_id)
+        except Exception as exc:
+            log.warning("composio_connection_recovery_failed", error=str(exc))
+
+    settings.composio.connection_id = recovered_id  # None if recovery failed
     save_settings(settings)
-    log.info("composio_key_set", auth_config_id=payload.auth_config_id)
+    log.info("composio_key_set", auth_config_id=payload.auth_config_id, recovered=recovered_id is not None)
     return _status_from_settings()
 
 

@@ -10,10 +10,7 @@ from sqlmodel import select
 from ...context import Context
 from ...errors import BehaviorError, NotConfiguredError
 from ...persistence.models import Session, SessionStatus
-from ...settings import save_settings
 from ...util.disk import check_free_space, estimate_card_size
-from ..resolve_drive_folder.contract import ResolveDriveFolderInput
-from ..resolve_drive_folder.handler import run as resolve_drive_folder
 from .contract import SessionOut, StartSessionInput
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9 _\-]+")
@@ -29,13 +26,12 @@ async def run(payload: StartSessionInput, ctx: Context) -> SessionOut:
     if not ctx.settings.local_root:
         raise NotConfiguredError("local_root_not_set")
 
+    base_folder_id = ctx.settings.drive_base_folder_id
+    if not base_folder_id:
+        raise NotConfiguredError("drive_base_folder_not_set")
+
     if not payload.source_mount_path.exists():
         raise BehaviorError(f"card_not_mounted: {payload.source_mount_path}")
-
-    # Validate Drive destination first — if this fails we don't touch the FS.
-    folder = await resolve_drive_folder(
-        ResolveDriveFolderInput(drive_folder_url=payload.drive_folder_url), ctx
-    )
 
     safe_name = _sanitize_customer_name(payload.customer_name)
     local_root = Path(ctx.settings.local_root)
@@ -51,10 +47,6 @@ async def run(payload: StartSessionInput, ctx: Context) -> SessionOut:
     )
     estimated = int(card_bytes * 1.5)
     disk = check_free_space(local_folder, estimated)
-
-    # Remember the destination in the MRU list (capped at 5).
-    ctx.settings.remember_drive_folder(payload.drive_folder_url)
-    save_settings(ctx.settings)
 
     session_id = uuid.uuid4().hex
     with ctx.db.session() as db:
@@ -77,8 +69,8 @@ async def run(payload: StartSessionInput, ctx: Context) -> SessionOut:
                 id=session_id,
                 customer_name=payload.customer_name,
                 customer_phone=payload.customer_phone,
-                drive_folder_url=payload.drive_folder_url,
-                drive_folder_id=folder.id,
+                drive_folder_url=ctx.settings.drive_base_folder_url or "",
+                drive_folder_id=base_folder_id,
                 source_mount_path=str(payload.source_mount_path),
                 local_folder=str(local_folder),
                 status=SessionStatus.queued if disk.ok else SessionStatus.failed,
@@ -101,9 +93,9 @@ async def run(payload: StartSessionInput, ctx: Context) -> SessionOut:
         id=session_id,
         customer_name=payload.customer_name,
         customer_phone=payload.customer_phone,
-        drive_folder_id=folder.id,
-        drive_folder_url=payload.drive_folder_url,
-        drive_folder_name=folder.name,
+        drive_folder_id=base_folder_id,
+        drive_folder_url=ctx.settings.drive_base_folder_url or "",
+        drive_folder_name="",
         source_mount_path=payload.source_mount_path,
         local_folder=local_folder,
         status="queued" if disk.ok else "failed",

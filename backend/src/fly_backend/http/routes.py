@@ -29,6 +29,8 @@ from ..behaviors.list_today_customers.contract import (
 from ..behaviors.list_today_customers.handler import run as list_today_customers
 from ..behaviors.make_share_link.contract import MakeShareLinkInput, ShareLink
 from ..behaviors.make_share_link.handler import run as make_share_link
+from ..behaviors.resolve_drive_folder.contract import ResolveDriveFolderInput
+from ..behaviors.resolve_drive_folder.handler import run as resolve_drive_folder
 from ..behaviors.start_session.contract import SessionOut, StartSessionInput
 from ..behaviors.start_session.handler import run as start_session
 from ..behaviors.upload_to_drive.contract import UploadToDriveInput
@@ -79,7 +81,36 @@ async def setup_status() -> dict[str, bool]:
         "composio_connected": s.composio.api_key_set and s.composio.google_connected,
         "calendar_id_set": bool(s.calendar_id),
         "local_root_set": bool(s.local_root),
+        "drive_base_folder_set": bool(s.drive_base_folder_id),
     }
+
+
+class _DriveBaseInput(BaseModel):
+    drive_folder_url: str
+
+
+@router.get("/setup/drive-base")
+async def setup_drive_base_get() -> dict[str, object]:
+    s = load_settings()
+    return {
+        "configured": bool(s.drive_base_folder_id),
+        "folder_id": s.drive_base_folder_id,
+        "folder_url": s.drive_base_folder_url,
+        "folder_name": None,
+    }
+
+
+@router.post("/setup/drive-base")
+async def setup_drive_base_post(body: _DriveBaseInput) -> dict[str, object]:
+    ctx = _ctx()
+    folder = await resolve_drive_folder(
+        ResolveDriveFolderInput(drive_folder_url=body.drive_folder_url), ctx
+    )
+    s = load_settings()
+    s.drive_base_folder_url = body.drive_folder_url.strip()
+    s.drive_base_folder_id = folder.id
+    save_settings(s)
+    return {"ok": True, "folder_id": folder.id, "folder_name": folder.name}
 
 
 class _CompleteOAuthBody(BaseModel):

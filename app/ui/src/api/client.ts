@@ -10,6 +10,8 @@ import type {
   ComposioPingResult,
   ComposioStartResult,
   ComposioStatus,
+  DriveBaseInput,
+  DriveBaseStatus,
   ListTodayCustomersOutput,
   SessionOut,
   SessionSummary,
@@ -81,6 +83,12 @@ export const api = {
   customersToday: (on?: string) =>
     request<ListTodayCustomersOutput>(`/customers/today${on ? `?on=${on}` : ""}`),
   cardsCurrent: () => request<CardDetected | null>("/cards/current"),
+  getDriveBase: () => request<DriveBaseStatus>("/setup/drive-base"),
+  setDriveBase: (input: DriveBaseInput) =>
+    request<{ ok: boolean; folder_id: string; folder_name: string }>("/setup/drive-base", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   createSession: (input: StartSessionInput) =>
     request<SessionOut>("/sessions", { method: "POST", body: JSON.stringify(input) }),
   getSession: (id: string) => request<SessionSummary>(`/sessions/${id}`),

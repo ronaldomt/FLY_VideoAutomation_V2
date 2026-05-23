@@ -21,7 +21,6 @@ class SessionOverrides(BaseModel):
 class StartSessionInput(BaseModel):
     customer_name: str = Field(min_length=1, max_length=200)
     customer_phone: str | None = None
-    drive_folder_url: str
     source_mount_path: Path
     overrides: SessionOverrides = Field(default_factory=SessionOverrides)
 

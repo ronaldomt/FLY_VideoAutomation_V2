@@ -1,7 +1,6 @@
 import { useMemo } from "react";
 import { useParams } from "react-router-dom";
 import { CustomerStep } from "./steps/CustomerStep";
-import { DestinationStep } from "./steps/DestinationStep";
 import { IngestStep } from "./steps/IngestStep";
 import { DoneStep } from "./steps/DoneStep";
 import { useSessionStore } from "@/state/session-store";
@@ -9,16 +8,13 @@ import type { SessionStep } from "@/state/session-store";
 
 /**
  * The unified Session route. A single page that walks the operator through
- * Customer → Destination → Ingest → Done. Step transitions are driven by the
- * Zustand store, not the URL — the URL stays on `/session/:sessionId`
- * throughout. Back/forward is allowed only before upload starts.
+ * Customer → Ingest → Done. Step transitions are driven by the Zustand store,
+ * not the URL — the URL stays on `/session/:sessionId` throughout.
+ * Drive destination is a base folder configured once in Settings.
  * See CLAUDE.md §9.
  */
 export function SessionPage() {
   const { sessionId } = useParams();
-  // Walk-in / first-time visit gets a temporary key. Once the orchestrator
-  // returns a server-side session id (in CustomerStep → DestinationStep), the
-  // slice carries it.
   const key = sessionId ?? "draft";
   const slice = useSessionStore((s) => s.sessions[key]);
   useSessionStore((s) => s.ensure(key));
@@ -29,8 +25,6 @@ export function SessionPage() {
     switch (step) {
       case "customer":
         return <CustomerStep sessionKey={key} />;
-      case "destination":
-        return <DestinationStep sessionKey={key} />;
       case "ingest":
         return <IngestStep sessionKey={key} />;
       case "done":
@@ -50,7 +44,6 @@ export function SessionPage() {
 
 const STEPS: { id: SessionStep; label: string }[] = [
   { id: "customer", label: "Customer" },
-  { id: "destination", label: "Destination" },
   { id: "ingest", label: "Ingest" },
   { id: "done", label: "Done" },
 ];

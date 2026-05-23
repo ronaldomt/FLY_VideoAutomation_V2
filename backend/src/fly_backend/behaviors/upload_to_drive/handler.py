@@ -27,11 +27,16 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
         parent_id = session.drive_folder_id
         customer_name = session.customer_name
 
-    # Create TD_<Customer>/ inside the destination folder, then Videos/ + Fotos/ under it.
-    customer_remote = await ctx.drive.ensure_subfolder(parent_id, f"TD_{customer_name}")
-    videos_remote = await ctx.drive.ensure_subfolder(customer_remote, "Videos")
-    fotos_remote = await ctx.drive.ensure_subfolder(customer_remote, "Fotos")
-    bucket_map = {"Videos": videos_remote, "Fotos": fotos_remote}
+    # Build YYYY/MMM/MMM-DD/TD_<Customer>/VIDEO + FOTOS under the base folder.
+    session_date = session.created_at.date()
+    year_remote = await ctx.drive.ensure_subfolder(parent_id, str(session_date.year))
+    month_remote = await ctx.drive.ensure_subfolder(year_remote, session_date.strftime("%b"))
+    day_remote = await ctx.drive.ensure_subfolder(month_remote, session_date.strftime("%b-%d"))
+    customer_remote = await ctx.drive.ensure_subfolder(day_remote, f"TD_{customer_name}")
+    video_remote = await ctx.drive.ensure_subfolder(customer_remote, "VIDEO")
+    fotos_remote = await ctx.drive.ensure_subfolder(customer_remote, "FOTOS")
+    # Keys match the relative_path prefix stored by copy_media / extract_frames.
+    bucket_map = {"Videos": video_remote, "Fotos": fotos_remote}
 
     with ctx.db.session() as db:
         records = db.exec(
@@ -88,8 +93,11 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
     tasks = [asyncio.create_task(_upload_one(r)) for r in to_upload]
 
     async def _drain() -> None:
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         await queue.put(_SENTINEL)
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
 
     drainer = asyncio.create_task(_drain())
 

@@ -42,6 +42,55 @@ LOG_LEVEL = os.environ.get("FLY_LOG_LEVEL", "INFO")
 RUN_TOKEN = os.environ.get("FLY_SIDECAR_TOKEN", "") or generate_token()
 WRITE_RUNTIME_FILE = os.environ.get("FLY_WRITE_RUNTIME_FILE", "1") != "0"
 
+# macOS default soft limit is 256; raise it to handle concurrent ffmpeg + uploads + SSE.
+try:
+    import resource as _resource
+    _soft, _hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    _resource.setrlimit(_resource.RLIMIT_NOFILE, (min(_hard, 4096), _hard))
+except Exception:
+    pass
+
+
+async def _recover_composio_connection(log: object) -> None:
+    """At startup, if the API key is set but connection_id is null, query Composio
+    for the most recent ACTIVE connection for this install and write it to settings.
+    Runs once per process start; failures are logged and swallowed."""
+    import httpx
+
+    from .secrets import get_composio_key
+    from .settings import load_settings, save_settings
+
+    settings = load_settings()
+    if not settings.composio.api_key_set or settings.composio.connection_id:
+        return  # Nothing to do
+    api_key = get_composio_key()
+    if not api_key:
+        return
+    user_id = settings.composio.user_id
+    if not user_id:
+        return
+    try:
+        _V1 = "https://backend.composio.dev/api/v1"
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(
+                f"{_V1}/connectedAccounts",
+                headers={"x-api-key": api_key},
+                params={"user_uuid": user_id, "pageSize": 50},
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+        active = [i for i in items if i.get("status") == "ACTIVE"]
+        if not active:
+            getattr(log, "warning", print)("composio_startup_recovery_no_active_connections")
+            return
+        active.sort(key=lambda i: i.get("updatedAt", ""), reverse=True)
+        recovered_id = str(active[0]["id"])
+        settings.composio.connection_id = recovered_id
+        save_settings(settings)
+        getattr(log, "info", print)("composio_startup_recovery_ok", connection_id=recovered_id)
+    except Exception as exc:
+        getattr(log, "warning", print)("composio_startup_recovery_failed", error=str(exc))
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -69,6 +118,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     set_card_callback(_on_card)
     poller_task = asyncio.create_task(start_disk_poller())
+
+    # Auto-recover Composio connection_id at startup when the API key is present
+    # but connection_id is null (e.g. after key rotation). This makes startup
+    # self-healing without requiring a UI action from the operator.
+    asyncio.create_task(_recover_composio_connection(log))
 
     try:
         yield
@@ -112,24 +166,31 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
         return await call_next(request)
 
+    err_log = get_logger("fly_backend.errors")
+
     @app.exception_handler(NotConfiguredError)
-    async def _handle_not_configured(_req: Request, exc: NotConfiguredError) -> JSONResponse:
+    async def _handle_not_configured(req: Request, exc: NotConfiguredError) -> JSONResponse:
+        err_log.warning("not_configured", path=req.url.path, error=str(exc))
         return JSONResponse(status_code=412, content={"error": str(exc)})
 
     @app.exception_handler(VerificationError)
-    async def _handle_verification(_req: Request, exc: VerificationError) -> JSONResponse:
+    async def _handle_verification(req: Request, exc: VerificationError) -> JSONResponse:
+        err_log.warning("verification_failed", path=req.url.path, error=str(exc))
         return JSONResponse(status_code=409, content={"error": str(exc)})
 
     @app.exception_handler(IntegrationError)
-    async def _handle_integration(_req: Request, exc: IntegrationError) -> JSONResponse:
+    async def _handle_integration(req: Request, exc: IntegrationError) -> JSONResponse:
+        err_log.error("integration_error", path=req.url.path, error=str(exc))
         return JSONResponse(status_code=502, content={"error": str(exc)})
 
     @app.exception_handler(BehaviorError)
-    async def _handle_behavior(_req: Request, exc: BehaviorError) -> JSONResponse:
+    async def _handle_behavior(req: Request, exc: BehaviorError) -> JSONResponse:
+        err_log.warning("behavior_error", path=req.url.path, error=str(exc))
         return JSONResponse(status_code=400, content={"error": str(exc)})
 
     @app.exception_handler(FlyBackendError)
-    async def _handle_generic(_req: Request, exc: FlyBackendError) -> JSONResponse:
+    async def _handle_generic(req: Request, exc: FlyBackendError) -> JSONResponse:
+        err_log.error("generic_backend_error", path=req.url.path, error=str(exc))
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
     app.include_router(router)

@@ -174,6 +174,7 @@ export function SettingsPage() {
                 className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none"
               />
             </Field>
+            <DriveBasePanel />
             <ComposioPanel />
           </>
         ) : null}
@@ -216,6 +217,90 @@ function Field({
 }
 
 /**
+ * Drive base folder panel.
+ *
+ * The operator pastes the root Google Drive folder URL once. All sessions
+ * upload to <base>/YYYY/MMM/MMM-DD/TD_<Name>/VIDEO + FOTOS.
+ */
+function DriveBasePanel() {
+  const qc = useQueryClient();
+  const status = useQuery({ queryKey: ["drive-base"], queryFn: api.getDriveBase });
+  const [url, setUrl] = useState("");
+  const [feedback, setFeedback] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
+
+  const save = useMutation({
+    mutationFn: () => api.setDriveBase({ drive_folder_url: url.trim() }),
+    onSuccess: (r) => {
+      setUrl("");
+      setFeedback({ kind: "ok", msg: `Saved: ${r.folder_name} (${r.folder_id})` });
+      qc.invalidateQueries({ queryKey: ["drive-base"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e) => {
+      const detail = e instanceof SidecarError ? extractDetail(e.body) : String(e);
+      setFeedback({ kind: "err", msg: `Failed: ${detail}` });
+    },
+  });
+
+  const s = status.data;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-md border border-slate-800 p-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium text-slate-200">Drive base folder</div>
+          <div className="text-xs text-slate-500">
+            Files go to: base/YYYY/MMM/MMM-DD/TD_Name/VIDEO + FOTOS
+          </div>
+        </div>
+        <span className={s?.configured ? "text-xs text-emerald-400" : "text-xs text-slate-500"}>
+          {s?.configured ? "✓ configured" : "○ not set"}
+        </span>
+      </div>
+
+      {s?.folder_url ? (
+        <div className="truncate rounded bg-slate-900 px-2 py-1.5 font-mono text-xs text-slate-400">
+          {s.folder_url}
+        </div>
+      ) : null}
+
+      <Field label="Paste new folder URL" description="Google Drive folder URL to use as the archive root.">
+        <input
+          type="url"
+          value={url}
+          onChange={(e) => { setUrl(e.target.value); setFeedback(null); }}
+          placeholder="https://drive.google.com/drive/folders/…"
+          className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm focus:border-emerald-500 focus:outline-none"
+        />
+      </Field>
+
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          disabled={url.trim().length < 10 || save.isPending}
+          onClick={() => save.mutate()}
+          className="rounded-md bg-emerald-500 px-3 py-1.5 text-sm font-medium text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+        >
+          {save.isPending ? "Validating…" : "Validate & Save"}
+        </button>
+      </div>
+
+      {feedback ? (
+        <div
+          className={`rounded-md border px-3 py-2 text-xs ${
+            feedback.kind === "ok"
+              ? "border-emerald-700/40 bg-emerald-950/30 text-emerald-200"
+              : "border-rose-700/50 bg-rose-950/30 text-rose-200"
+          }`}
+        >
+          {feedback.msg}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * Composio integration panel.
  *
  * Two inputs: API key (write-only — never round-tripped from the backend)
@@ -238,6 +323,8 @@ function ComposioPanel() {
   const [apiKey, setApiKey] = useState("");
   const [authConfigId, setAuthConfigId] = useState("");
   const [feedback, setFeedback] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
+  const [oauthPhase, setOauthPhase] = useState<"idle" | "opened" | "done" | "error">("idle");
+  const [oauthConnId, setOauthConnId] = useState("");
 
   useEffect(() => {
     if (status.data?.auth_config_id) setAuthConfigId(status.data.auth_config_id);
@@ -285,10 +372,40 @@ function ComposioPanel() {
     },
   });
 
+  const startReconnect = useMutation({
+    mutationFn: api.startComposio,
+    onSuccess: (result) => {
+      window.open(result.auth_url, "_blank", "noopener,noreferrer");
+      setOauthConnId(result.connection_request_id);
+      setOauthPhase("opened");
+    },
+    onError: (e) => {
+      const detail = e instanceof SidecarError ? extractDetail(e.body) : String(e);
+      setFeedback({ kind: "err", msg: `Reconnect failed: ${detail}` });
+      setOauthPhase("error");
+    },
+  });
+
+  const completeReconnect = useMutation({
+    mutationFn: () => api.completeComposio(oauthConnId),
+    onSuccess: () => {
+      setOauthPhase("done");
+      setFeedback({ kind: "ok", msg: "Google reconnected." });
+      qc.invalidateQueries({ queryKey: ["composio-status"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (e) => {
+      const detail = e instanceof SidecarError ? extractDetail(e.body) : String(e);
+      setFeedback({ kind: "err", msg: `Verification failed: ${detail}` });
+      setOauthPhase("error");
+    },
+  });
+
   const s = status.data;
   const canSave =
     apiKey.trim().length >= 8 && authConfigId.trim().length >= 4 && !save.isPending;
   const canPing = !!s?.api_key_set && !!s?.auth_config_id && !ping.isPending;
+  const canReconnect = !!s?.api_key_set && !!s?.auth_config_id && !startReconnect.isPending;
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-slate-800 p-4">
@@ -372,6 +489,39 @@ function ComposioPanel() {
             Last validated {new Date(s.last_validated_at).toLocaleString()}
           </span>
         ) : null}
+      </div>
+
+      <div className="mt-1 border-t border-slate-800 pt-3">
+        <div className="mb-2 text-xs font-medium text-slate-400">Google OAuth</div>
+        {oauthPhase === "idle" || oauthPhase === "error" || oauthPhase === "done" ? (
+          <button
+            type="button"
+            disabled={!canReconnect}
+            onClick={() => { setOauthPhase("idle"); startReconnect.mutate(); }}
+            className="rounded-md border border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-900 disabled:opacity-40"
+          >
+            {startReconnect.isPending ? "Opening…" : s?.google_connected ? "Reconnect Google" : "Connect Google"}
+          </button>
+        ) : (
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-slate-400">Google opened in a new tab. Authorize, then click Verify.</span>
+            <button
+              type="button"
+              disabled={completeReconnect.isPending}
+              onClick={() => completeReconnect.mutate()}
+              className="rounded-md bg-emerald-500 px-3 py-1.5 text-sm font-medium text-emerald-950 hover:bg-emerald-400 disabled:opacity-40"
+            >
+              {completeReconnect.isPending ? "Verifying…" : "Verify"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setOauthPhase("idle")}
+              className="text-xs text-slate-500 hover:text-slate-300"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
       </div>
 
       {feedback ? (

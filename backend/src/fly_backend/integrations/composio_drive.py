@@ -134,7 +134,7 @@ class LiveDriveClient:
 
     # ── Composio action execution (v2) ──────────────────────────────────────
 
-    def _exec(self, action: str, params: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover
+    def _exec(self, action: str, params: dict[str, Any], timeout: int = 60) -> dict[str, Any]:  # pragma: no cover
         from .composio_client import composio_execute
 
         result = composio_execute(
@@ -143,6 +143,7 @@ class LiveDriveClient:
             entity_id=self.user_id,
             action=action,
             input_params=params,
+            timeout=timeout,
         )
         return result.get("data") or {}
 
@@ -232,10 +233,6 @@ class LiveDriveClient:
         Falls back to Composio's v3 presigned URL flow if OAuth token is unavailable.
         Returns the Drive file_id.
         """
-        token = self._get_oauth_token()
-        if token:
-            return self._upload_direct(local, parent_folder_id, token)
-
         data = local.read_bytes()
         md5 = hashlib.md5(data).hexdigest()
         mime = _guess_mime(local.name)
@@ -267,21 +264,28 @@ class LiveDriveClient:
                 presigned_url,
                 data=data,
                 headers={"Content-Type": mime},
-                timeout=max(60, len(data) // (256 * 1024)),  # ~1s per 256KB
+                timeout=max(120, len(data) // (256 * 1024)),  # ~1s per 256KB
             )
             resp2.raise_for_status()
         except _requests.HTTPError as exc:
             raise IntegrationError(f"composio_s3_upload_failed: {exc.response.text}") from exc
 
-        # Step 3: Execute Drive upload action with the s3key
+        # Step 3: Execute Drive upload action with the s3key.
+        # The correct folder parameter is `folder_to_upload_to` (confirmed from Composio schema).
+        # Large video files can take >60s for Composio's R2→Drive transfer; use 300s.
         result = self._exec(
             "GOOGLEDRIVE_UPLOAD_FILE",
             {
                 "file_to_upload": {"name": local.name, "mimetype": mime, "s3key": s3key},
-                "parent_folder_id": parent_folder_id,
+                "folder_to_upload_to": parent_folder_id,
             },
+            timeout=300,
         )
-        file_id: str = result.get("id", "")
+        # v2 execute API may return the response either unwrapped {"id": ...}
+        # or wrapped {"data": {"id": ...}, "successful": true}
+        file_id: str = str(
+            result.get("id") or (result.get("data") or {}).get("id") or ""
+        )
         if not file_id:
             raise IntegrationError(f"composio_upload_no_file_id: {result}")
         return file_id
@@ -404,14 +408,18 @@ def _guess_mime(filename: str) -> str:
 
 
 def build_drive_client(settings: "Settings") -> DriveClient:
-    if settings.composio.google_connected and settings.composio.connection_id:
-        from ..secrets import get_composio_key
+    from ..errors import NotConfiguredError
+    from ..secrets import get_composio_key
 
-        api_key = get_composio_key()
-        if api_key:
-            return LiveDriveClient(
-                api_key=api_key,
-                user_id=settings.composio.user_id or "",
-                connection_id=settings.composio.connection_id,
-            )
-    return MockDriveClient()
+    if not settings.composio.api_key_set:
+        raise NotConfiguredError("composio_api_key_missing")
+    if not settings.composio.connection_id:
+        raise NotConfiguredError("composio_google_not_connected")
+    api_key = get_composio_key()
+    if not api_key:
+        raise NotConfiguredError("composio_api_key_missing")
+    return LiveDriveClient(
+        api_key=api_key,
+        user_id=settings.composio.user_id or "",
+        connection_id=settings.composio.connection_id,
+    )

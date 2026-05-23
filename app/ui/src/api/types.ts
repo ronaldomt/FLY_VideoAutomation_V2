@@ -98,6 +98,8 @@ export interface CardDetected {
 
 export interface Settings {
   local_root: string | null;
+  drive_base_folder_url: string | null;
+  drive_base_folder_id: string | null;
   drive_recent_folders: string[];
   calendar_id: string;
   extraction: {
@@ -165,6 +167,7 @@ export interface SetupStatus {
   composio_connected: boolean;
   calendar_id_set: boolean;
   local_root_set: boolean;
+  drive_base_folder_set: boolean;
 }
 
 export interface ComposioStartResult {
@@ -175,9 +178,19 @@ export interface ComposioStartResult {
 export interface StartSessionInput {
   customer_name: string;
   customer_phone?: string | null;
-  drive_folder_url: string;
   source_mount_path: string;
   overrides?: { fps?: number; extraction_enabled?: boolean };
+}
+
+export interface DriveBaseStatus {
+  configured: boolean;
+  folder_id: string | null;
+  folder_url: string | null;
+  folder_name: string | null;
+}
+
+export interface DriveBaseInput {
+  drive_folder_url: string;
 }
 
 export interface WipeResult {

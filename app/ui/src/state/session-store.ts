@@ -7,14 +7,12 @@
 import { create } from "zustand";
 import type { CustomerEvent, ProgressEvent, VerificationReport } from "@/api/types";
 
-export type SessionStep = "customer" | "destination" | "ingest" | "done";
+export type SessionStep = "customer" | "ingest" | "done";
 
 interface SessionSlice {
   step: SessionStep;
   customer: CustomerEvent | null;
   walkInName: string | null;
-  driveFolderUrl: string;
-  driveFolderName: string | null;
   sourceMountPath: string | null;
   serverSessionId: string | null;
   progress: ProgressEvent[];
@@ -35,8 +33,6 @@ const emptySlice = (): SessionSlice => ({
   step: "customer",
   customer: null,
   walkInName: null,
-  driveFolderUrl: "",
-  driveFolderName: null,
   sourceMountPath: null,
   serverSessionId: null,
   progress: [],

@@ -39,15 +39,6 @@ class CalendarClient(Protocol):
     async def list_events(self, on: date) -> list[CustomerEvent]: ...
 
 
-class MockCalendarClient:
-    """Returns a small, stable list so the UI is always testable offline."""
-
-    async def list_events(self, on: date) -> list[CustomerEvent]:
-        return [
-            CustomerEvent(time="09:00", name="Ana Souza", phone="+5511999990001", type="HC"),
-            CustomerEvent(time="09:30", name="Bruno Lima", phone="+5511999990002", type="VIP"),
-            CustomerEvent(time="10:00", name="Carla Mendes"),
-        ]
 
 
 # ── title parser ─────────────────────────────────────────────────────────────
@@ -147,13 +138,15 @@ class LiveCalendarClient:
         return await asyncio.get_event_loop().run_in_executor(None, self._list_sync, on)
 
     def _list_sync(self, on: date) -> list[CustomerEvent]:  # pragma: no cover
-        from composio import ComposioToolSet
+        from .composio_client import composio_execute
 
-        toolset = ComposioToolSet(api_key=self.api_key, entity_id=self.user_id)
         day = on.isoformat()
-        result: dict[str, Any] = toolset.execute_action(
+        result = composio_execute(
+            api_key=self.api_key,
+            connection_id=self.connection_id,
+            entity_id=self.user_id,
             action="GOOGLECALENDAR_EVENTS_LIST",
-            params={
+            input_params={
                 "calendarId": self.calendar_id,
                 "timeMin": f"{day}T00:00:00Z",
                 "timeMax": f"{day}T23:59:59Z",
@@ -161,25 +154,25 @@ class LiveCalendarClient:
                 "orderBy": "startTime",
                 "maxResults": 100,
             },
-            connected_account_id=self.connection_id,
         )
         items: list[dict[str, Any]] = (result.get("data") or {}).get("items") or []
         return [_parse_event(item) for item in items]
 
 
 def build_calendar_client(settings: Settings) -> CalendarClient:
-    import os
+    from ..errors import NotConfiguredError
+    from ..secrets import get_composio_key
 
-    live = os.environ.get("COMPOSIO_LIVE", "0") == "1"
-    if live and settings.composio.google_connected and settings.composio.connection_id:
-        from ..secrets import get_composio_key
-
-        api_key = get_composio_key()
-        if api_key:
-            return LiveCalendarClient(
-                calendar_id=settings.calendar_id,
-                api_key=api_key,
-                user_id=settings.composio.user_id or "",
-                connection_id=settings.composio.connection_id,
-            )
-    return MockCalendarClient()
+    if not settings.composio.api_key_set:
+        raise NotConfiguredError("composio_api_key_missing")
+    if not settings.composio.connection_id:
+        raise NotConfiguredError("composio_google_not_connected")
+    api_key = get_composio_key()
+    if not api_key:
+        raise NotConfiguredError("composio_api_key_missing")
+    return LiveCalendarClient(
+        calendar_id=settings.calendar_id,
+        api_key=api_key,
+        user_id=settings.composio.user_id or "",
+        connection_id=settings.composio.connection_id,
+    )

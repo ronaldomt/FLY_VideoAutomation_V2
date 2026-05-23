@@ -19,11 +19,52 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
+
+import requests as _requests
 
 from ..errors import IntegrationError, NotConfiguredError
 from ..secrets import get_composio_key
 from ..settings import Settings, save_settings
+
+_COMPOSIO_V2 = "https://backend.composio.dev/api/v2"
+
+
+def composio_execute(
+    api_key: str,
+    connection_id: str,
+    entity_id: str,
+    action: str,
+    input_params: dict[str, Any],
+    timeout: int = 60,
+) -> dict[str, Any]:
+    """Execute a Composio action via the v2 REST API.
+
+    Bypasses the SDK's execute_action / check_connected_account path, which
+    rejects googlesuper connections when GOOGLECALENDAR/GOOGLEDRIVE actions are
+    requested. The v2 endpoint accepts the UUID-format connection_id directly.
+
+    Raises IntegrationError on HTTP or parse failure.
+    """
+    app_prefix = action.split("_")[0]
+    try:
+        resp = _requests.post(
+            f"{_COMPOSIO_V2}/actions/{action}/execute",
+            headers={"x-api-key": api_key},
+            json={
+                "connectedAccountId": connection_id,
+                "entityId": entity_id,
+                "appName": app_prefix,
+                "input": input_params,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except _requests.HTTPError as exc:
+        raise IntegrationError(f"composio_execute_failed: {exc.response.text}") from exc
+    except Exception as exc:
+        raise IntegrationError(f"composio_execute_failed: {exc}") from exc
 
 
 @dataclass(slots=True, frozen=True)
@@ -86,18 +127,12 @@ class _RealComposioClient:
         return Composio(api_key=self.cfg.api_key)
 
     def ping(self) -> None:
-        # Cheapest call we can make that actually exercises auth: list the
-        # toolkits available to this key. If the key is invalid the SDK
-        # raises.
+        # validate_api_key is a static method that hits /client/auth/client_info.
+        # Raises ApiKeyError (subclass of Exception) on 401/403.
         try:
-            self._client.toolkits.list()  # type: ignore[attr-defined]
-        except AttributeError:
-            # SDK shape changes between versions; fall back to a tool fetch
-            # which also requires a valid key.
-            try:
-                self._client.tools.get(user_id=self.cfg.user_id, tools=[])  # type: ignore[attr-defined]
-            except Exception as exc:
-                raise IntegrationError(f"composio_ping_failed: {exc}") from exc
+            from composio import Composio
+
+            Composio.validate_api_key(self.cfg.api_key)
         except Exception as exc:
             raise IntegrationError(f"composio_ping_failed: {exc}") from exc
 

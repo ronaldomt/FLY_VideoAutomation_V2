@@ -80,6 +80,8 @@ class Settings(BaseModel):
     """Top-level settings document. JSON-persisted at SETTINGS_FILE."""
 
     local_root: str | None = None
+    drive_base_folder_url: str | None = None
+    drive_base_folder_id: str | None = None
     drive_recent_folders: list[str] = Field(default_factory=list)
     calendar_id: str = "primary"
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
