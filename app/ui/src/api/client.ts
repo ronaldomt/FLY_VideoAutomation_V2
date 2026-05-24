@@ -100,6 +100,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ confirm }),
     }),
+  cancelSession: (id: string) =>
+    request<{ ok: boolean }>(`/sessions/${id}/cancel`, { method: "POST" }),
   /**
    * Subscribes to `/sessions/:id/events` via EventSource. Returns a teardown
    * function. The SSE stream emits `progress`, `verification`, and `done`
@@ -111,6 +113,7 @@ export const api = {
       onProgress?: (e: ProgressEventPayload) => void;
       onVerification?: (e: VerificationReport) => void;
       onDone?: (e: { ok: boolean; session_id: string }) => void;
+      onCancelled?: () => void;
       onError?: (e: Event) => void;
     },
   ): () => void {
@@ -141,6 +144,9 @@ export const api = {
       } catch (err) {
         console.error("malformed done event", err);
       }
+    });
+    sse.addEventListener("cancelled", () => {
+      handlers.onCancelled?.();
     });
     sse.onerror = (e) => handlers.onError?.(e);
     return () => sse.close();

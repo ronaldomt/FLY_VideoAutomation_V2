@@ -79,6 +79,8 @@ async def run(payload: CopyMediaInput, ctx: Context) -> AsyncIterator[ProgressEv
     _mark_phase(ctx, payload.session_id, PhaseStatus.running, current=0, total=total)
 
     for i, (src, bucket) in enumerate(candidates, start=1):
+        if ctx.cancel_event and ctx.cancel_event.is_set():
+            return
         rel = Path(bucket) / src.name
         dst = _unique_target(local_root / rel)
         rel_str = str(dst.relative_to(local_root))

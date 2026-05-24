@@ -9,7 +9,8 @@ See CLAUDE.md §7.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .logging import get_logger
@@ -34,6 +35,7 @@ class Context:
     drive: DriveClient
     ffmpeg: FfmpegClient
     db: Database
+    cancel_event: asyncio.Event | None = field(default=None)
 
     def with_bindings(self, **bindings: object) -> Context:
         """Return a shallow copy with a logger that has extra bound fields."""
@@ -44,6 +46,7 @@ class Context:
             drive=self.drive,
             ffmpeg=self.ffmpeg,
             db=self.db,
+            cancel_event=self.cancel_event,
         )
 
 

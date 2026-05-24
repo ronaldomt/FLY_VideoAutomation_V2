@@ -49,6 +49,8 @@ async def run(payload: ExtractFramesInput, ctx: Context) -> AsyncIterator[Progre
     _mark_phase(ctx, payload.session_id, PhaseStatus.running, 0, total)
 
     for i, video in enumerate(videos, start=1):
+        if ctx.cancel_event and ctx.cancel_event.is_set():
+            return
         log.info("extracting", video=video.name, fps=fps)
         async for frame in ctx.ffmpeg.extract_frames(
             video, fotos_dir, fps, ctx.settings.extraction.jpeg_quality

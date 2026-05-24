@@ -7,6 +7,8 @@ Events on `GET /sessions/:id/events`.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterator
 from datetime import date
@@ -49,6 +51,9 @@ from . import integrations_routes
 
 router = APIRouter()
 router.include_router(integrations_routes.router)
+
+# Per-session cancel events. Keyed by session_id, populated during SSE stream.
+_cancel_events: dict[str, asyncio.Event] = {}
 
 
 def _ctx():  # type: ignore[no-untyped-def]
@@ -336,43 +341,78 @@ async def sessions_events(session_id: str, request: Request) -> EventSourceRespo
 
     Phase order: copy_media → extract_frames → upload_to_drive → verify_upload.
     Each ProgressEvent is encoded as JSON in the SSE `data:` field. The stream
-    closes once verification completes. If the client disconnects, in-flight
-    phases continue running (DB-backed; resumable from `/sessions/:id`).
+    closes once verification completes or the session is cancelled.
     """
-    ctx = _ctx()
-    with ctx.db.session() as db:
+    base_ctx = _ctx()
+    with base_ctx.db.session() as db:
         if db.get(Session, session_id) is None:
             raise HTTPException(status_code=404, detail="unknown_session")
 
-    async def _stream() -> AsyncIterator[dict[str, str]]:
-        for behavior, inp in (
-            (copy_media, CopyMediaInput(session_id=session_id)),
-            (extract_frames, ExtractFramesInput(session_id=session_id)),
-            (upload_to_drive, UploadToDriveInput(session_id=session_id)),
-        ):
-            async for event in behavior(inp, ctx):  # type: ignore[arg-type]
-                if await request.is_disconnected():
-                    return
-                yield {"event": "progress", "data": event.model_dump_json()}
-        # Verification is one-shot, not a stream.
-        report = await verify_upload(VerifyUploadInput(session_id=session_id), ctx)
-        yield {"event": "verification", "data": report.model_dump_json()}
+    cancel_event = asyncio.Event()
+    _cancel_events[session_id] = cancel_event
+    ctx = dataclasses.replace(base_ctx, cancel_event=cancel_event)
 
-        # Mark the session completed/failed.
-        with ctx.db.session() as db:
-            sess = db.get(Session, session_id)
-            if sess is not None:
-                sess.status = SessionStatus.completed if report.ok else SessionStatus.failed
-                if not report.ok:
-                    sess.error = f"verification_failed: {len(report.mismatches)} mismatches"
-                db.add(sess)
-                db.commit()
-        yield {
-            "event": "done",
-            "data": json.dumps({"ok": report.ok, "session_id": session_id}),
-        }
+    async def _stream() -> AsyncIterator[dict[str, str]]:
+        try:
+            for behavior, inp in (
+                (copy_media, CopyMediaInput(session_id=session_id)),
+                (extract_frames, ExtractFramesInput(session_id=session_id)),
+                (upload_to_drive, UploadToDriveInput(session_id=session_id)),
+            ):
+                async for event in behavior(inp, ctx):  # type: ignore[arg-type]
+                    if await request.is_disconnected():
+                        return
+                    yield {"event": "progress", "data": event.model_dump_json()}
+                if cancel_event.is_set():
+                    yield {"event": "cancelled", "data": json.dumps({"session_id": session_id})}
+                    return
+            # Verification is one-shot, not a stream.
+            report = await verify_upload(VerifyUploadInput(session_id=session_id), ctx)
+            yield {"event": "verification", "data": report.model_dump_json()}
+
+            with ctx.db.session() as db:
+                sess = db.get(Session, session_id)
+                if sess is not None:
+                    sess.status = SessionStatus.completed if report.ok else SessionStatus.failed
+                    if not report.ok:
+                        sess.error = f"verification_failed: {len(report.mismatches)} mismatches"
+                    db.add(sess)
+                    db.commit()
+            yield {
+                "event": "done",
+                "data": json.dumps({"ok": report.ok, "session_id": session_id}),
+            }
+        finally:
+            _cancel_events.pop(session_id, None)
 
     return EventSourceResponse(_stream())
+
+
+@router.post("/sessions/{session_id}/cancel")
+async def sessions_cancel(session_id: str) -> dict[str, bool]:
+    """Signal cancellation of a running or queued session.
+
+    Sets the in-memory cancel event (stops the SSE phase loop) and marks the
+    session cancelled in the DB. Idempotent — calling on an already-cancelled
+    session returns ok=true. Returns 409 if the session is already completed/failed.
+    """
+    ctx = _ctx()
+    with ctx.db.session() as db:
+        sess = db.get(Session, session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="unknown_session")
+        if sess.status in {SessionStatus.completed, SessionStatus.failed}:
+            raise HTTPException(status_code=409, detail="session_already_terminal")
+        if sess.status != SessionStatus.cancelled:
+            sess.status = SessionStatus.cancelled
+            db.add(sess)
+            db.commit()
+
+    event = _cancel_events.get(session_id)
+    if event is not None:
+        event.set()
+
+    return {"ok": True}
 
 
 @router.post("/sessions/{session_id}/verify", response_model=VerificationReport)

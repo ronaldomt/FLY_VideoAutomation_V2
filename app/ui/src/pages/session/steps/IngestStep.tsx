@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
 import { useSessionStore } from "@/state/session-store";
 
@@ -7,6 +8,8 @@ export function IngestStep({ sessionKey }: { sessionKey: string }) {
   const appendProgress = useSessionStore((s) => s.appendProgress);
   const patch = useSessionStore((s) => s.patch);
   const setStep = useSessionStore((s) => s.setStep);
+  const reset = useSessionStore((s) => s.reset);
+  const navigate = useNavigate();
   const [sseError, setSseError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -15,9 +18,13 @@ export function IngestStep({ sessionKey }: { sessionKey: string }) {
       onProgress: (e) => appendProgress(sessionKey, e),
       onVerification: (e) => patch(sessionKey, { verification: e }),
       onDone: () => setStep(sessionKey, "done"),
+      onCancelled: () => {
+        reset(sessionKey);
+        navigate("/");
+      },
       onError: (e) => setSseError(`stream_error: ${(e as ErrorEvent).message || "connection failed"}`),
     });
-  }, [slice?.serverSessionId, sessionKey, appendProgress, patch, setStep]);
+  }, [slice?.serverSessionId, sessionKey, appendProgress, patch, setStep, reset, navigate]);
 
   const events = slice?.progress ?? [];
   const byPhase = events.reduce<Record<string, { current: number; total: number; message: string | null | undefined }>>(

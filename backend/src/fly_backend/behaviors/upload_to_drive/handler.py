@@ -61,6 +61,8 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
 
     async def _upload_one(record: FileRecord) -> None:
         nonlocal completed
+        if ctx.cancel_event and ctx.cancel_event.is_set():
+            return
         bucket = record.relative_path.split("/", 1)[0]
         remote_parent = bucket_map.get(bucket)
         if not remote_parent:
@@ -105,6 +107,8 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
         while True:
             event = await queue.get()
             if event is _SENTINEL:
+                break
+            if ctx.cancel_event and ctx.cancel_event.is_set():
                 break
             yield event
             _mark_phase(

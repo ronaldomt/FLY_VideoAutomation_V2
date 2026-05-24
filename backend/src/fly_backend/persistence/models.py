@@ -17,6 +17,7 @@ class SessionStatus(StrEnum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class PhaseName(StrEnum):
