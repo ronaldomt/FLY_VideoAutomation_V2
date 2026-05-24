@@ -10,6 +10,7 @@ from sqlmodel import select
 from ...context import Context
 from ...errors import BehaviorError
 from ...persistence.models import FileRecord, Phase, PhaseName, PhaseStatus, Session
+from ...util.remote_paths import ensure_session_subfolders
 from ..progress import ProgressEvent
 from .contract import UploadToDriveInput
 
@@ -24,17 +25,8 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
         if session.drive_folder_id is None:
             raise BehaviorError("session_missing_drive_folder_id")
         local_root = Path(session.local_folder)
-        parent_id = session.drive_folder_id
-        customer_name = session.customer_name
 
-    # Build YYYY/MMM/MMM-DD/TD_<Customer>/VIDEO + FOTOS under the base folder.
-    session_date = session.created_at.date()
-    year_remote = await ctx.drive.ensure_subfolder(parent_id, str(session_date.year))
-    month_remote = await ctx.drive.ensure_subfolder(year_remote, session_date.strftime("%b"))
-    day_remote = await ctx.drive.ensure_subfolder(month_remote, session_date.strftime("%b-%d"))
-    customer_remote = await ctx.drive.ensure_subfolder(day_remote, f"TD_{customer_name}")
-    video_remote = await ctx.drive.ensure_subfolder(customer_remote, "VIDEO")
-    fotos_remote = await ctx.drive.ensure_subfolder(customer_remote, "FOTOS")
+    video_remote, fotos_remote = await ensure_session_subfolders(session, ctx.drive)
     # Keys match the relative_path prefix stored by copy_media / extract_frames.
     bucket_map = {"Videos": video_remote, "Fotos": fotos_remote}
 

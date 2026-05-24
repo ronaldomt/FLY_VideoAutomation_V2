@@ -1,13 +1,16 @@
 """Google Drive via Composio (correct action names + v3 upload flow).
 
-Action mapping verified 2026-05-22:
+Action mapping verified 2026-05-24 against /api/v3/tools/<action> schema:
   GOOGLEDRIVE_GET_FILE_INFO       → NOT FOUND
-    Replaced: validate via GOOGLEDRIVE_LIST_FILES, name via GOOGLEDRIVE_FIND_FOLDER
+    Replaced: validate via GOOGLEDRIVE_LIST_FILES (`q` query)
   GOOGLEDRIVE_LIST_FILES_IN_FOLDER→ NOT FOUND
-    Replaced: GOOGLEDRIVE_LIST_FILES (query: '<id>' in parents)
-  GOOGLEDRIVE_CREATE_FOLDER       → EXISTS; field is folder_name (not name)
+    Replaced: GOOGLEDRIVE_LIST_FILES (query param is `q`, NOT `query`)
+  GOOGLEDRIVE_CREATE_FOLDER       → EXISTS; params are `folder_name` + `parent_id`
+                                    (NOT `parent_folder_id` — that one is silently
+                                    ignored, causing folders to land at Drive root)
   GOOGLEDRIVE_UPLOAD_FILE         → EXISTS but requires v3 presigned URL flow
     Flow: POST /api/v3/files/upload/request → PUT presigned_url → execute with s3key
+    Folder target param: `folder_to_upload_to`
   GOOGLEDRIVE_SHARE_FILE          → NOT FOUND
     Replaced: URL construction only (folder creator controls sharing in My Drive)
 """
@@ -295,60 +298,54 @@ class LiveDriveClient:
     async def get_folder(self, folder_id: str) -> DriveFolder:  # pragma: no cover
         """Validate folder exists and return its metadata.
 
-        Uses LIST_FILES to confirm access, then FIND_FOLDER to get the name.
+        Uses LIST_FILES (with the correct `q` param) to confirm access. Returns
+        folder_id as the name — Composio has no reliable ID→name action and the
+        user already knows what folder they pasted.
         """
-        # Validate access — this raises IntegrationError if folder is inaccessible
         await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
                 "GOOGLEDRIVE_LIST_FILES",
-                {"query": f"'{folder_id}' in parents and trashed=false"},
+                {"q": f"'{folder_id}' in parents and trashed=false"},
             ),
         )
-        # Best-effort: find the folder name by scanning FIND_FOLDER results
-        name = folder_id
-        try:
-            folders_data = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._exec(
-                    "GOOGLEDRIVE_FIND_FOLDER",
-                    {"query": "mimeType='application/vnd.google-apps.folder' and trashed=false"},
-                ),
-            )
-            for f in folders_data.get("files") or []:
-                if f.get("id") == folder_id:
-                    name = f.get("name", folder_id)
-                    break
-        except Exception:
-            pass
-        return DriveFolder(id=folder_id, name=name, path=name)
+        return DriveFolder(id=folder_id, name=folder_id, path=folder_id)
 
     async def ensure_subfolder(self, parent_id: str, name: str) -> str:  # pragma: no cover
         """Return id of existing subfolder named `name`, creating it if absent."""
         if not parent_id:
             raise IntegrationError("ensure_subfolder: parent_id is empty")
+        # Search for an existing subfolder under parent_id matching the name.
+        # The query param is `q` (not `query`); Composio silently ignores misspelled params.
         data = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
                 "GOOGLEDRIVE_LIST_FILES",
                 {
-                    "query": (
+                    "q": (
                         f"'{parent_id}' in parents"
-                        f" and name='{name}'"
+                        f" and name='{_escape_query_literal(name)}'"
                         f" and mimeType='application/vnd.google-apps.folder'"
                         f" and trashed=false"
-                    )
+                    ),
+                    "fields": "files(id,name,parents)",
+                    "pageSize": 100,
                 },
             ),
         )
+        # Defensive client-side filter: only accept a hit whose parents include parent_id.
         for f in data.get("files") or []:
-            if f.get("name") == name:
+            if f.get("name") != name:
+                continue
+            parents = f.get("parents") or []
+            if not parents or parent_id in parents:
                 return str(f["id"])
+        # Create — the correct nest param is `parent_id`, not `parent_folder_id`.
         created = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: self._exec(
                 "GOOGLEDRIVE_CREATE_FOLDER",
-                {"folder_name": name, "parent_folder_id": parent_id},
+                {"folder_name": name, "parent_id": parent_id},
             ),
         )
         folder_id = str(created.get("id") or "")
@@ -372,11 +369,21 @@ class LiveDriveClient:
             None,
             lambda: self._exec(
                 "GOOGLEDRIVE_LIST_FILES",
-                {"query": f"'{folder_id}' in parents and trashed=false"},
+                {
+                    "q": f"'{folder_id}' in parents and trashed=false",
+                    "fields": "files(id,name,size,md5Checksum,parents)",
+                    "pageSize": 1000,
+                },
             ),
         )
         out = []
         for f in data.get("files") or []:
+            # Defensive: only include files whose parents include folder_id when
+            # the response carries parents. Some Composio responses strip it; in
+            # that case we trust the `q` filter we just sent.
+            parents = f.get("parents")
+            if parents and folder_id not in parents:
+                continue
             out.append(
                 DriveFile(
                     id=f.get("id", ""),
@@ -405,6 +412,11 @@ def _guess_mime(filename: str) -> str:
         ".jpeg": "image/jpeg",
         ".png": "image/png",
     }.get(ext, "application/octet-stream")
+
+
+def _escape_query_literal(value: str) -> str:
+    """Escape a Drive query string literal (backslash + single quote)."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def build_drive_client(settings: "Settings") -> DriveClient:

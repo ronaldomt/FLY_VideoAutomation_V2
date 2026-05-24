@@ -8,6 +8,7 @@ from ...context import Context
 from ...errors import BehaviorError
 from ...persistence.models import FileRecord, Session
 from ...util.hashing import md5_file
+from ...util.remote_paths import ensure_session_subfolders
 from .contract import Mismatch, VerificationReport, VerifyUploadInput
 
 
@@ -24,9 +25,9 @@ async def run(payload: VerifyUploadInput, ctx: Context) -> VerificationReport:
             select(FileRecord).where(FileRecord.session_id == payload.session_id)
         ).all()
 
-    videos_remote = await ctx.drive.ensure_subfolder(session.drive_folder_id, "Videos")
-    fotos_remote = await ctx.drive.ensure_subfolder(session.drive_folder_id, "Fotos")
-    bucket_map = {"Videos": videos_remote, "Fotos": fotos_remote}
+    video_remote, fotos_remote = await ensure_session_subfolders(session, ctx.drive)
+    # Local bucket names ("Videos"/"Fotos" from copy_media) → remote subfolder IDs.
+    bucket_map = {"Videos": video_remote, "Fotos": fotos_remote}
 
     drive_index: dict[tuple[str, str], tuple[int, str]] = {}
     for bucket, remote_id in bucket_map.items():
