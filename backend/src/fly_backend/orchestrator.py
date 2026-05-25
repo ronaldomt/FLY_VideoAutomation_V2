@@ -33,8 +33,10 @@ from .behaviors.upload_to_drive.handler import run as upload_to_drive
 from .behaviors.verify_upload.contract import VerifyUploadInput
 from .behaviors.verify_upload.handler import run as verify_upload
 from .context import Context, build_default_context
+from .errors import ConcurrencyLimitError
 from .logging import get_logger
 from .persistence.models import Session, SessionStatus
+from .settings import load_settings
 
 # Per-subscriber queue cap. Drop-oldest on overflow; DB Phase rows are the
 # source of truth for progress, so a lagging UI catches up on the next event.
@@ -69,11 +71,24 @@ class Orchestrator:
         """Start the pipeline for ``session_id`` if not already running.
 
         Idempotent: a second call while the task is alive returns the same task.
+        Raises ``ConcurrencyLimitError`` when another distinct session is
+        already alive and ``settings.session_concurrency`` would be exceeded.
         """
         async with self._lock:
             state = self._states.get(session_id)
             if state is not None and not state.task.done():
                 return state.task
+            alive_others = [
+                sid
+                for sid, st in self._states.items()
+                if sid != session_id and not st.task.done()
+            ]
+            cap = max(1, load_settings().session_concurrency)
+            if len(alive_others) >= cap:
+                raise ConcurrencyLimitError(
+                    f"session_concurrency_limit: {len(alive_others)} in flight, "
+                    f"cap={cap}, alive={alive_others}"
+                )
             cancel_event = asyncio.Event()
             task = asyncio.create_task(
                 self._run(session_id, cancel_event), name=f"ingest:{session_id}"
@@ -114,18 +129,26 @@ class Orchestrator:
         with contextlib.suppress(asyncio.CancelledError):
             await state.task
 
-    async def resume_pending(self) -> list[str]:
-        """Re-spawn orchestrator tasks for sessions left queued/running.
+    async def reconcile_pending(self) -> list[str]:
+        """Mark every session left in queued/running as ``failed``.
 
-        Called from the FastAPI lifespan on startup so an interrupted sidecar
-        picks up where the last process left off (CLAUDE.md §15). Returns the
-        list of resumed session IDs for logging.
+        Called from the FastAPI lifespan on startup. We deliberately do NOT
+        respawn these sessions — see ``docs/decisions/0003-no-auto-resume.md``.
+        The V1 operator model is "one operator, one card per session"; auto
+        resume causes accumulated stale rows from earlier broken versions of
+        the code to all spawn in parallel on the next boot, hosing the local
+        disk before the operator can react. ``copy_media`` is idempotent via
+        ``FileRecord`` rows, so the operator can cheaply retry a failed
+        session by inserting the same card and picking the customer again.
+
+        Returns the list of reconciled session IDs for logging.
         """
         from sqlmodel import select
 
         from .persistence.models import Session, SessionStatus
 
         ctx = self._context_factory()
+        reconciled: list[str] = []
         with ctx.db.session() as db:
             rows = db.exec(
                 select(Session).where(
@@ -134,11 +157,15 @@ class Orchestrator:
                     )
                 )
             ).all()
-        resumed: list[str] = []
-        for s in rows:
-            await self.spawn(s.id)
-            resumed.append(s.id)
-        return resumed
+            for s in rows:
+                s.status = SessionStatus.failed
+                if not s.error:
+                    s.error = "interrupted_by_restart"
+                db.add(s)
+                reconciled.append(s.id)
+            if reconciled:
+                db.commit()
+        return reconciled
 
     def _publish(self, session_id: str, event_name: str, data: str) -> None:
         state = self._states.get(session_id)

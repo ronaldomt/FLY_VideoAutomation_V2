@@ -124,20 +124,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # self-healing without requiring a UI action from the operator.
     asyncio.create_task(_recover_composio_connection(log))
 
-    # CLAUDE.md §15: resume any session left in queued/running state by a
-    # previous process. The orchestrator's idempotent ``spawn`` re-attaches
-    # the pipeline and continues from whatever phase the SQLite Phase rows
-    # say it had reached. copy_media + extract_frames + upload_to_drive are
-    # all idempotent via FileRecord rows. Wrapped in try/except so a malformed
-    # row or missing integration config never blocks the sidecar from booting.
+    # Reconcile orphaned sessions left in queued/running by a previous
+    # process. We do NOT auto-respawn — see
+    # ``docs/decisions/0003-no-auto-resume.md``. Wrapped in try/except so a
+    # malformed row can never block the sidecar from booting.
     from .orchestrator import orchestrator
 
     try:
-        resumed = await orchestrator.resume_pending()
-        if resumed:
-            log.info("resumed_pending_sessions", session_ids=resumed)
+        reconciled = await orchestrator.reconcile_pending()
+        if reconciled:
+            log.info("reconciled_orphaned_sessions", session_ids=reconciled)
     except Exception as exc:
-        log.warning("resume_pending_failed", error=str(exc))
+        log.warning("reconcile_pending_failed", error=str(exc))
 
     try:
         yield

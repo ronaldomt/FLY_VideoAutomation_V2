@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from fly_backend.context import Context
+from fly_backend.errors import ConcurrencyLimitError
 from fly_backend.integrations.composio_calendar import CustomerEvent
 from fly_backend.integrations.composio_drive import MockDriveClient
 from fly_backend.integrations.ffmpeg import FfmpegClient
@@ -263,14 +264,14 @@ async def test_module_singleton_is_usable(empty_card: Path, tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_resume_pending_relaunches_queued_sessions(
+async def test_reconcile_pending_marks_zombies_failed_without_spawning(
     tmp_path: Path, empty_card: Path
 ) -> None:
-    """Sessions left in queued/running state by a previous process should be
-    picked up by ``resume_pending()`` (CLAUDE.md §15)."""
+    """Sessions left in queued/running by a previous process must be flipped
+    to failed with ``interrupted_by_restart`` and NOT respawned. See
+    ``docs/decisions/0003-no-auto-resume.md``."""
     ctx, _db = _build_test_context(tmp_path)
     queued_sid = _make_session(ctx, empty_card, customer="Queued")
-    # Manually flip a second one to "running" to simulate a crash mid-pipeline.
     running_sid = _make_session(ctx, empty_card, customer="Running")
     with ctx.db.session() as db:
         sess = db.get(Session, running_sid)
@@ -278,7 +279,7 @@ async def test_resume_pending_relaunches_queued_sessions(
         sess.status = SessionStatus.running
         db.add(sess)
         db.commit()
-    # A completed session must NOT be resumed.
+    # Completed/failed/cancelled rows must be untouched.
     done_sid = _make_session(ctx, empty_card, customer="Done")
     with ctx.db.session() as db:
         sess = db.get(Session, done_sid)
@@ -288,20 +289,48 @@ async def test_resume_pending_relaunches_queued_sessions(
         db.commit()
 
     o = Orchestrator(context_factory=lambda: ctx)
-    resumed = await o.resume_pending()
-    assert set(resumed) == {queued_sid, running_sid}
+    reconciled = await o.reconcile_pending()
+    assert set(reconciled) == {queued_sid, running_sid}
 
-    await o.wait(queued_sid)
-    await o.wait(running_sid)
+    # No orchestrator tasks were spawned — registry must be empty.
+    assert not o.is_running(queued_sid)
+    assert not o.is_running(running_sid)
+
     with ctx.db.session() as db:
         for sid in (queued_sid, running_sid):
             sess = db.get(Session, sid)
             assert sess is not None
-            assert sess.status == SessionStatus.completed
+            assert sess.status == SessionStatus.failed
+            assert sess.error == "interrupted_by_restart"
         # Untouched.
         done = db.get(Session, done_sid)
         assert done is not None
         assert done.status == SessionStatus.completed
+        assert done.error is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_when_another_session_is_alive(
+    orch: tuple[Orchestrator, Context], empty_card: Path
+) -> None:
+    """Concurrency cap = 1: while session A is running, spawning B raises
+    ``ConcurrencyLimitError``. After A finishes, B can spawn."""
+    o, ctx = orch
+    sid_a = _make_session(ctx, empty_card, customer="A")
+    sid_b = _make_session(ctx, empty_card, customer="B")
+    await o.spawn(sid_a)
+    # A's task is created but the cap check sees it as alive.
+    with pytest.raises(ConcurrencyLimitError):
+        await o.spawn(sid_b)
+    await o.wait(sid_a)
+    # After A finishes, B should be spawnable.
+    await o.spawn(sid_b)
+    await o.wait(sid_b)
+    with ctx.db.session() as db:
+        for sid in (sid_a, sid_b):
+            sess = db.get(Session, sid)
+            assert sess is not None
+            assert sess.status == SessionStatus.completed
 
 
 @pytest.mark.asyncio

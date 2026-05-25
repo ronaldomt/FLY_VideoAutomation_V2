@@ -26,6 +26,19 @@ async def run(payload: UploadToDriveInput, ctx: Context) -> AsyncIterator[Progre
             raise BehaviorError("session_missing_drive_folder_id")
         local_root = Path(session.local_folder)
 
+    # Preflight: confirm the configured Drive folder still exists. If the
+    # operator renamed or deleted it after start_session ran, fail with a
+    # clear reason instead of letting the first upload attempt crash with
+    # whatever the SDK throws.
+    try:
+        await ctx.drive.get_folder(session.drive_folder_id)
+    except Exception as exc:
+        log.warning("drive_folder_preflight_failed", error=str(exc))
+        raise BehaviorError(
+            f"drive_folder_not_found: {session.drive_folder_id} — "
+            "the destination folder may have been renamed or removed"
+        ) from exc
+
     video_remote, fotos_remote = await ensure_session_subfolders(session, ctx.drive)
     # Keys match the relative_path prefix stored by copy_media / extract_frames.
     bucket_map = {"Videos": video_remote, "Fotos": fotos_remote}

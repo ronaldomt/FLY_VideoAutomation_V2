@@ -24,3 +24,11 @@ class VerificationError(FlyBackendError):
 
 class NotConfiguredError(BehaviorError):
     """Required setting is missing (e.g., local_root unset)."""
+
+
+class ConcurrencyLimitError(BehaviorError):
+    """Another session is already running and `settings.session_concurrency`
+    is reached. The HTTP layer maps this to ``409 session_concurrency_limit``.
+    V1 scope says "one session at a time per workstation"; the cap is
+    configurable so v2 can lift it without code changes.
+    """

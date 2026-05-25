@@ -84,6 +84,9 @@ class Settings(BaseModel):
     drive_base_folder_id: str | None = None
     drive_recent_folders: list[str] = Field(default_factory=list)
     calendar_id: str = "primary"
+    # Max in-flight ingest sessions on this workstation. V1 scope is one at
+    # a time; the cap is in settings so v2 can lift it without code changes.
+    session_concurrency: int = Field(default=1, ge=1, le=8)
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     upload: UploadSettings = Field(default_factory=UploadSettings)

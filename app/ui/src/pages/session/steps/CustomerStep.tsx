@@ -1,34 +1,42 @@
+import { SidecarError, api } from "@/api/client";
+import { friendlyError } from "@/api/error-messages";
+import type { CardDetected, CustomerEvent } from "@/api/types";
+import { useCardStore } from "@/state/card-store";
+import { useSessionStore } from "@/state/session-store";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ArrowRight, Search, UserPlus } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { api, SidecarError } from "@/api/client";
-import type { CustomerEvent } from "@/api/types";
-import { useCardStore } from "@/state/card-store";
-import { useSessionStore } from "@/state/session-store";
 
 export function CustomerStep({ sessionKey }: { sessionKey: string }) {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<{ name: string; phone: string | null } | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [selectedSource, setSelectedSource] = useState<CardDetected | null>(null);
 
   const customers = useQuery({
     queryKey: ["customers-today"],
     queryFn: () => api.customersToday(),
   });
 
-  // Poll for card so the user can insert after picking a customer.
-  const cardPoll = useQuery({
-    queryKey: ["card-current"],
-    queryFn: api.cardsCurrent,
+  // Poll all connected cards so the operator can select among multiple sources.
+  const cardsPoll = useQuery({
+    queryKey: ["cards-list"],
+    queryFn: api.cardsList,
     refetchInterval: 2_000,
   });
-  const lastCard = useCardStore((s) => s.lastCard);
   const setCard = useCardStore((s) => s.setCard);
+
+  const availableCards = cardsPoll.data ?? [];
+
+  // Auto-select when exactly one card is present; clear selection when it disappears.
   useEffect(() => {
-    if (cardPoll.data && cardPoll.data.mount_path !== lastCard?.mount_path) {
-      setCard(cardPoll.data);
+    if (availableCards.length === 1 && availableCards[0]) {
+      setSelectedSource(availableCards[0]);
+      setCard(availableCards[0]);
+    } else if (availableCards.length === 0) {
+      setSelectedSource(null);
     }
-  }, [cardPoll.data, lastCard?.mount_path, setCard]);
+  }, [availableCards.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const patch = useSessionStore((s) => s.patch);
   const setStep = useSessionStore((s) => s.setStep);
@@ -40,18 +48,23 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
     return rows.filter((r) => r.name.toLowerCase().includes(q));
   }, [customers.data, query]);
 
-  const card = cardPoll.data ?? lastCard;
-
   const create = useMutation({
     mutationFn: () => {
-      if (!selected || !card?.mount_path) throw new Error("no_customer_or_card");
+      if (!selected || !selectedSource?.mount_path) throw new Error("no_customer_or_card");
       return api.createSession({
         customer_name: selected.name,
         customer_phone: selected.phone ?? null,
-        source_mount_path: card.mount_path,
+        source_mount_path: selectedSource.mount_path,
       });
     },
     onSuccess: (data) => {
+      if (!data.disk_check_ok) {
+        const gb = (data.shortfall_bytes / 1024 ** 3).toFixed(1);
+        setErrorMessage(
+          `Not enough disk space — ${gb} GB short. Free up space on the archive drive and try again.`,
+        );
+        return;
+      }
       patch(sessionKey, {
         serverSessionId: data.id,
         sourceMountPath: data.source_mount_path,
@@ -61,7 +74,7 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
     onError: (e) => {
       if (e instanceof SidecarError) {
         const body = e.body as { detail?: string; error?: string } | null;
-        setErrorMessage(body?.detail ?? body?.error ?? "session_failed");
+        setErrorMessage(friendlyError(body?.detail ?? body?.error ?? "session_failed"));
       } else {
         setErrorMessage(String(e));
       }
@@ -79,7 +92,7 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
       <section className="flex flex-col gap-4">
         <header>
           <h1 className="text-xl font-semibold">Ready to start?</h1>
-          <p className="text-sm text-slate-400">Confirm the customer and insert the SD card.</p>
+          <p className="text-sm text-slate-400">Confirm the customer and select the source card.</p>
         </header>
 
         <div className="rounded-md border border-slate-800 p-4">
@@ -90,17 +103,49 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
           ) : null}
         </div>
 
-        <div
-          className={`rounded-md border p-3 text-sm ${
-            card?.mount_path
-              ? "border-emerald-700/40 bg-emerald-950/20 text-emerald-200"
-              : "border-amber-700/40 bg-amber-950/30 text-amber-200"
-          }`}
-        >
-          {card?.mount_path
-            ? `Card detected: ${card.mount_path}`
-            : "No card detected — insert SD card or GoPro to continue."}
-        </div>
+        {availableCards.length === 0 ? (
+          <div className="rounded-md border border-amber-700/40 bg-amber-950/30 p-3 text-sm text-amber-200">
+            No card detected — insert SD card or GoPro to continue.
+          </div>
+        ) : availableCards.length === 1 && availableCards[0] ? (
+          <div className="rounded-md border border-emerald-700/40 bg-emerald-950/20 p-3 text-sm text-emerald-200">
+            Card detected: {availableCards[0].mount_path}
+            {availableCards[0].already_ingested_within_hour ? (
+              <span className="ml-2 text-amber-300">(already ingested in the last hour)</span>
+            ) : null}
+          </div>
+        ) : (
+          <div className="rounded-md border border-slate-700 p-3">
+            <div className="mb-2 text-sm text-slate-300">Select source card</div>
+            <ul className="flex flex-col gap-1.5">
+              {availableCards.map((c) => {
+                const isChosen = selectedSource?.volume_id === c.volume_id;
+                return (
+                  <li key={c.volume_id}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedSource(c);
+                        setCard(c);
+                      }}
+                      className={`w-full rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                        isChosen
+                          ? "border-emerald-500/60 bg-emerald-950/30 text-emerald-200"
+                          : "border-slate-700 text-slate-300 hover:border-slate-500 hover:bg-slate-900"
+                      }`}
+                    >
+                      <span className="font-medium">{c.label ?? "(no label)"}</span>
+                      <span className="ml-2 font-mono text-xs text-slate-400">{c.mount_path}</span>
+                      {c.already_ingested_within_hour ? (
+                        <span className="ml-2 text-xs text-amber-400">already ingested</span>
+                      ) : null}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
 
         {errorMessage ? (
           <div className="rounded-md border border-rose-700/50 bg-rose-950/30 p-3 text-sm text-rose-200">
@@ -121,7 +166,7 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
           </button>
           <button
             type="button"
-            disabled={!card?.mount_path || create.isPending}
+            disabled={!selectedSource?.mount_path || create.isPending}
             onClick={() => create.mutate()}
             className="inline-flex items-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-sm font-medium text-emerald-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
@@ -136,9 +181,7 @@ export function CustomerStep({ sessionKey }: { sessionKey: string }) {
     <section className="flex flex-col gap-4">
       <header>
         <h1 className="text-xl font-semibold">Who's the customer?</h1>
-        <p className="text-sm text-slate-400">
-          Pick from today's calendar or add a walk-in.
-        </p>
+        <p className="text-sm text-slate-400">Pick from today's calendar or add a walk-in.</p>
       </header>
       <div className="relative">
         <Search size={14} className="absolute left-3 top-2.5 text-slate-500" />

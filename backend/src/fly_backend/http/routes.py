@@ -307,13 +307,110 @@ async def cards_list() -> list[dict[str, object]]:
 
 @router.post("/sessions", response_model=SessionOut)
 async def sessions_create(payload: StartSessionInput) -> SessionOut:
+    from ..errors import ConcurrencyLimitError
+
     out = await start_session(payload, _ctx())
     # Spawn the detached orchestrator task. The SSE endpoint is a pure
     # observer; the work runs whether or not anyone is listening.
     # Skip when start_session failed the pre-flight check (e.g. disk_full).
     if out.status == "queued":
-        await orchestrator.spawn(out.id)
+        try:
+            await orchestrator.spawn(out.id)
+        except ConcurrencyLimitError as exc:
+            # Roll the new session back to failed so the DB doesn't keep an
+            # orphan queued row the operator can't see. The frontend's 409
+            # handler surfaces "Another session is already running."
+            ctx = _ctx()
+            with ctx.db.session() as db:
+                sess = db.get(Session, out.id)
+                if sess is not None:
+                    sess.status = SessionStatus.failed
+                    sess.error = "session_concurrency_limit"
+                    db.add(sess)
+                    db.commit()
+            raise HTTPException(
+                status_code=409, detail="session_concurrency_limit"
+            ) from exc
     return out
+
+
+@router.get("/sessions/recent")
+async def sessions_recent(
+    status: str | None = None, limit: int = 20
+) -> list[dict[str, object]]:
+    """List recent sessions, newest first. Powers the Idle page's failed
+    sessions surface. ``status`` filters by SessionStatus value; ``limit`` is
+    capped at 100 to keep the response cheap.
+    """
+    from sqlmodel import select
+
+    cap = max(1, min(limit, 100))
+    ctx = _ctx()
+    with ctx.db.session() as db:
+        stmt = select(Session)
+        if status is not None:
+            try:
+                wanted = SessionStatus(status)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"invalid_status: {status}"
+                ) from exc
+            stmt = stmt.where(Session.status == wanted)
+        stmt = stmt.order_by(Session.created_at.desc()).limit(cap)  # type: ignore[attr-defined]
+        rows = db.exec(stmt).all()
+        return [
+            {
+                "id": s.id,
+                "customer_name": s.customer_name,
+                "status": s.status.value,
+                "error": s.error,
+                "created_at": s.created_at.isoformat(),
+                "local_folder": s.local_folder,
+            }
+            for s in rows
+        ]
+
+
+@router.delete("/sessions/failed")
+async def sessions_clear_failed(older_than_hours: int = 0) -> dict[str, int]:
+    """Delete failed + cancelled sessions older than ``older_than_hours`` hours.
+
+    Default 0 = delete all failed/cancelled regardless of age. Cascades to
+    Phase and FileRecord rows for those sessions. Does NOT delete the
+    associated local folders — that's a deliberately separate, scarier
+    action the operator triggers from Finder.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlmodel import select
+
+    from ..persistence.models import FileRecord
+
+    ctx = _ctx()
+    cutoff = datetime.now(UTC) - timedelta(hours=max(0, older_than_hours))
+    terminal = (SessionStatus.failed, SessionStatus.cancelled)
+    with ctx.db.session() as db:
+        stmt = select(Session).where(
+            Session.status.in_(terminal),  # type: ignore[attr-defined]
+            Session.created_at <= cutoff,
+        )
+        rows = db.exec(stmt).all()
+        ids = [s.id for s in rows]
+        if not ids:
+            return {"deleted": 0}
+        # Manual cascade — SQLModel doesn't auto-cascade by default.
+        for phase in db.exec(
+            select(Phase).where(Phase.session_id.in_(ids))  # type: ignore[attr-defined]
+        ).all():
+            db.delete(phase)
+        for fr in db.exec(
+            select(FileRecord).where(FileRecord.session_id.in_(ids))  # type: ignore[attr-defined]
+        ).all():
+            db.delete(fr)
+        for sess in rows:
+            db.delete(sess)
+        db.commit()
+    return {"deleted": len(ids)}
 
 
 @router.get("/sessions/{session_id}")

@@ -15,7 +15,10 @@ declare global {
   }
 }
 
-const DEFAULT_URL = "http://127.0.0.1:8765";
+// Defaults match `backend/run-dev.sh`, which binds uvicorn to :8000 and
+// sets FLY_SIDECAR_TOKEN=dev-token. Override in app/ui/.env.local for any
+// other dev setup (see app/ui/.env.example).
+const DEFAULT_URL = "http://127.0.0.1:8000";
 const DEFAULT_TOKEN = "dev-token";
 
 export interface SidecarConfig {

@@ -504,7 +504,7 @@ cd app/ui && pnpm biome check .
 ## 15. Logging, error handling, recovery
 
 - **Logs**: JSON via `structlog`. Written to `~/.fly-video-automation/logs/YYYY-MM-DD.log` (rotating). Also exposed via `/logs` endpoint.
-- **Job queue**: SQLite. Every session's phases are rows. On startup, the backend resumes any session in state `running` or `queued`.
+- **Job queue**: SQLite. Every session's phases are rows. On startup, the backend **reconciles** any session in state `queued` or `running` to `failed` with reason `interrupted_by_restart`. The operator decides whether to retry — `copy_media` is idempotent via `FileRecord` rows so retry is cheap. Auto-resume was tried and walked back: see `docs/decisions/0003-no-auto-resume.md`.
 - **Idempotency**: copy + upload behaviors must be safe to re-run. Use file hashes to skip already-completed files.
 - **Backoff**: exponential on Drive 429/5xx, max 6 retries, then mark phase `failed` (not the session).
 - **Crash safety**: writes go to temp filenames + atomic rename. Never partial writes visible to the upload step.

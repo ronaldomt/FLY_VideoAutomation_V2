@@ -13,7 +13,9 @@ import type {
   DriveBaseInput,
   DriveBaseStatus,
   ListTodayCustomersOutput,
+  RecentSession,
   SessionOut,
+  SessionStatus,
   SessionSummary,
   Settings,
   SetupStatus,
@@ -92,6 +94,17 @@ export const api = {
   createSession: (input: StartSessionInput) =>
     request<SessionOut>("/sessions", { method: "POST", body: JSON.stringify(input) }),
   getSession: (id: string) => request<SessionSummary>(`/sessions/${id}`),
+  recentSessions: (opts: { status?: SessionStatus; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.status) params.set("status", opts.status);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return request<RecentSession[]>(`/sessions/recent${qs ? `?${qs}` : ""}`);
+  },
+  clearFailedSessions: (olderThanHours = 0) =>
+    request<{ deleted: number }>(`/sessions/failed?older_than_hours=${olderThanHours}`, {
+      method: "DELETE",
+    }),
   verifySession: (id: string) =>
     request<VerificationReport>(`/sessions/${id}/verify`, { method: "POST" }),
   shareLink: (id: string) => request<ShareLink>(`/sessions/${id}/share-link`),

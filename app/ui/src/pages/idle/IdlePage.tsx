@@ -1,11 +1,13 @@
-import { useQuery } from "@tanstack/react-query";
-import { Disc3, Plus } from "lucide-react";
-import { Link, useNavigate } from "react-router-dom";
-import { useEffect } from "react";
 import { api } from "@/api/client";
 import { EmptyState } from "@/components/EmptyState";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useCardStore } from "@/state/card-store";
+import { useSessionStore } from "@/state/session-store";
+import { useQuery } from "@tanstack/react-query";
+import { Disc3, Plus } from "lucide-react";
+import { useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+import { FailedSessionsCard } from "./FailedSessionsCard";
 
 /**
  * Empty state. Polls `/cards/current`. When a card insert event arrives, the
@@ -16,6 +18,7 @@ export function IdlePage() {
   const navigate = useNavigate();
   const lastCard = useCardStore((s) => s.lastCard);
   const setCard = useCardStore((s) => s.setCard);
+  const resetDraft = useSessionStore((s) => s.reset);
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
   const card = useQuery({
@@ -28,10 +31,11 @@ export function IdlePage() {
     if (card.data && card.data.mount_path !== lastCard?.mount_path) {
       setCard(card.data);
       if (settings.data?.ui.auto_focus_on_card_insert !== false) {
+        resetDraft("draft");
         navigate("/session");
       }
     }
-  }, [card.data, lastCard?.mount_path, setCard, navigate, settings.data]);
+  }, [card.data, lastCard?.mount_path, setCard, navigate, settings.data, resetDraft]);
 
   return (
     <EmptyState
@@ -39,12 +43,16 @@ export function IdlePage() {
       description="The app will jump to the customer picker automatically. You can also start a new session manually."
     >
       <div className="mt-4 flex items-center gap-3">
-        <Link
-          to="/session"
+        <button
+          type="button"
+          onClick={() => {
+            resetDraft("draft");
+            navigate("/session");
+          }}
           className="inline-flex items-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-sm font-medium text-emerald-950 hover:bg-emerald-400"
         >
           <Plus size={16} /> New session
-        </Link>
+        </button>
       </div>
 
       <div className="mt-10 grid w-full grid-cols-1 gap-3 text-left">
@@ -55,7 +63,8 @@ export function IdlePage() {
           <div className="mt-1 text-sm text-slate-100">
             {lastCard ? (
               <>
-                {lastCard.label ?? "(no label)"} — <code className="text-xs">{lastCard.mount_path}</code>
+                {lastCard.label ?? "(no label)"} —{" "}
+                <code className="text-xs">{lastCard.mount_path}</code>
                 {lastCard.already_ingested_within_hour ? (
                   <span className="ml-2 text-xs text-amber-300">
                     Already ingested in the last hour
@@ -82,6 +91,7 @@ export function IdlePage() {
             />
           </div>
         </div>
+        <FailedSessionsCard />
       </div>
     </EmptyState>
   );

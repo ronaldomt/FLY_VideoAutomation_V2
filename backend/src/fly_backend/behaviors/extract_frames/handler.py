@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,9 +10,16 @@ from sqlmodel import select
 from ...context import Context
 from ...errors import BehaviorError
 from ...persistence.models import FileRecord, Phase, PhaseName, PhaseStatus, Session
+from ...util.disk import check_free_space
 from ...util.hashing import md5_file
 from ..progress import ProgressEvent
 from .contract import ExtractFramesInput
+
+# If free space drops below this between videos, abort the phase rather than
+# let ffmpeg crash mid-write. 500 MB is a heuristic: a single 4K MP4 minute
+# can emit ~50 MB of JPGs at 1 fps; 500 MB gives headroom for one more video
+# of typical length while still failing fast.
+_LOW_WATER_BYTES = 500_000_000
 
 
 async def run(payload: ExtractFramesInput, ctx: Context) -> AsyncIterator[ProgressEvent]:
@@ -46,34 +54,83 @@ async def run(payload: ExtractFramesInput, ctx: Context) -> AsyncIterator[Progre
         _mark_phase(ctx, payload.session_id, PhaseStatus.completed, 0, 0)
         return
 
+    # Preflight: estimate that frame output peaks at ~2x total video bytes.
+    # Caller-provided estimate, so we skip the built-in 10% safety margin and
+    # provide our own headroom in the multiplier.
+    total_video_bytes = sum(v.stat().st_size for v in videos)
+    preflight = check_free_space(local, total_video_bytes * 2, safety_pct=0.0)
+    if not preflight.ok:
+        _mark_phase(ctx, payload.session_id, PhaseStatus.failed, 0, total)
+        raise BehaviorError(
+            f"disk_full_at_extract_start: {preflight.free_bytes:,} bytes free, "
+            f"need ~{preflight.required_bytes:,}"
+        )
+
     _mark_phase(ctx, payload.session_id, PhaseStatus.running, 0, total)
 
     for i, video in enumerate(videos, start=1):
         if ctx.cancel_event and ctx.cancel_event.is_set():
             return
+        # Re-check free space between videos: ffmpeg's per-video output is
+        # hard to predict, so a low-water trip is the only safe stop.
+        free_now = shutil.disk_usage(local).free
+        if free_now < _LOW_WATER_BYTES:
+            _mark_phase(ctx, payload.session_id, PhaseStatus.failed, i - 1, total)
+            raise BehaviorError(
+                f"disk_full_during_extraction: {free_now:,} bytes free, "
+                f"below low-water threshold {_LOW_WATER_BYTES:,}"
+            )
+
         log.info("extracting", video=video.name, fps=fps)
-        async for frame in ctx.ffmpeg.extract_frames(
-            video, fotos_dir, fps, ctx.settings.extraction.jpeg_quality
-        ):
-            rel_str = str(frame.frame_path.relative_to(local))
-            with ctx.db.session() as db:
-                existing = db.exec(
-                    select(FileRecord).where(
-                        FileRecord.session_id == payload.session_id,
-                        FileRecord.relative_path == rel_str,
-                    )
-                ).first()
-                if existing is None:
-                    size = frame.frame_path.stat().st_size
-                    db.add(
-                        FileRecord(
-                            session_id=payload.session_id,
-                            relative_path=rel_str,
-                            size=size,
-                            md5=md5_file(frame.frame_path) if size > 0 else None,
+        # Write to a per-video temp dir so a partial / failed ffmpeg run
+        # never leaves orphan JPGs in Fotos/. We drain ALL frames into the
+        # temp dir first, then bulk-move into Fotos/ as a single atomic step
+        # — partial yields followed by a crash never expose half-written
+        # files alongside verified ones.
+        temp_dir = fotos_dir / f".in-progress-{video.stem}"
+        if temp_dir.exists():
+            # Stale temp from a previous crash. Remove before reusing.
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        produced_frames: list[Path] = []
+        try:
+            async for frame in ctx.ffmpeg.extract_frames(
+                video, temp_dir, fps, ctx.settings.extraction.jpeg_quality
+            ):
+                produced_frames.append(frame.frame_path)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+        # Success: move every frame into Fotos/ and record it.
+        try:
+            for temp_path in produced_frames:
+                final_path = fotos_dir / temp_path.name
+                shutil.move(str(temp_path), str(final_path))
+                rel_str = str(final_path.relative_to(local))
+                with ctx.db.session() as db:
+                    existing = db.exec(
+                        select(FileRecord).where(
+                            FileRecord.session_id == payload.session_id,
+                            FileRecord.relative_path == rel_str,
                         )
-                    )
-                    db.commit()
+                    ).first()
+                    if existing is None:
+                        size = final_path.stat().st_size
+                        db.add(
+                            FileRecord(
+                                session_id=payload.session_id,
+                                relative_path=rel_str,
+                                size=size,
+                                md5=md5_file(final_path) if size > 0 else None,
+                            )
+                        )
+                        db.commit()
+        finally:
+            # Empty after success (all files moved). rmtree is a no-op then.
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
         yield ProgressEvent(
             phase=PhaseName.extract_frames.value,
             current=i,

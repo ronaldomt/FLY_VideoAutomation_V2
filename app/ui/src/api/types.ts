@@ -5,7 +5,16 @@
  * should be regenerated via `openapi-typescript` against `/openapi.json`.
  */
 
-export type SessionStatus = "queued" | "running" | "completed" | "failed";
+export type SessionStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export interface RecentSession {
+  id: string;
+  customer_name: string;
+  status: SessionStatus;
+  error: string | null;
+  created_at: string;
+  local_folder: string;
+}
 
 export interface CustomerEvent {
   time: string;

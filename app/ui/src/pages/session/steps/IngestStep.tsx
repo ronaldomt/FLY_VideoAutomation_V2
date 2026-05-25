@@ -1,4 +1,5 @@
 import { api } from "@/api/client";
+import { friendlyError } from "@/api/error-messages";
 import { useSessionStore } from "@/state/session-store";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -54,12 +55,9 @@ export function IngestStep({ sessionKey }: { sessionKey: string }) {
         navigate("/");
       },
       onPipelineError: (msg) => {
-        const friendly = msg.startsWith("disk_full")
-          ? "Disk is full — free up space on the archive drive and retry."
-          : msg;
         clearEscalation();
         setReconnecting(false);
-        setSseError(friendly);
+        setSseError(friendlyError(msg));
       },
       onError: () => {
         // EventSource will auto-reconnect; treat as a soft "reconnecting"
