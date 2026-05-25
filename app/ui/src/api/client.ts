@@ -63,8 +63,7 @@ export const api = {
   putSettings: (settings: Settings) =>
     request<Settings>("/settings", { method: "PUT", body: JSON.stringify(settings) }),
   setupStatus: () => request<SetupStatus>("/setup/status"),
-  startComposio: () =>
-    request<ComposioStartResult>("/setup/composio/start", { method: "POST" }),
+  startComposio: () => request<ComposioStartResult>("/setup/composio/start", { method: "POST" }),
   completeComposio: (connectionRequestId: string) =>
     request<{ ok: boolean }>("/setup/composio/complete", {
       method: "POST",
@@ -83,6 +82,7 @@ export const api = {
   customersToday: (on?: string) =>
     request<ListTodayCustomersOutput>(`/customers/today${on ? `?on=${on}` : ""}`),
   cardsCurrent: () => request<CardDetected | null>("/cards/current"),
+  cardsList: () => request<CardDetected[]>("/cards/list"),
   getDriveBase: () => request<DriveBaseStatus>("/setup/drive-base"),
   setDriveBase: (input: DriveBaseInput) =>
     request<{ ok: boolean; folder_id: string; folder_name: string }>("/setup/drive-base", {
@@ -110,20 +110,24 @@ export const api = {
   subscribeEvents(
     id: string,
     handlers: {
+      onOpen?: () => void;
       onProgress?: (e: ProgressEventPayload) => void;
       onVerification?: (e: VerificationReport) => void;
       onDone?: (e: { ok: boolean; session_id: string }) => void;
       onCancelled?: () => void;
+      onPipelineError?: (msg: string) => void;
       onError?: (e: Event) => void;
     },
   ): () => void {
     const { url, token } = getSidecarConfig();
-    // EventSource doesn't allow custom headers — pass the token via query in dev.
-    // The sidecar still validates the standard header for non-SSE requests.
-    const sse = new EventSource(
-      `${url}/sessions/${id}/events?token=${encodeURIComponent(token)}`,
-      { withCredentials: false },
-    );
+    // EventSource cannot send custom headers — the sidecar auth middleware
+    // (backend/src/fly_backend/http/auth.py) explicitly accepts the token via
+    // ?token= query parameter, with the standard X-Sidecar-Token header
+    // enforced on every other route.
+    const sse = new EventSource(`${url}/sessions/${id}/events?token=${encodeURIComponent(token)}`, {
+      withCredentials: false,
+    });
+    sse.addEventListener("open", () => handlers.onOpen?.());
     sse.addEventListener("progress", (e: MessageEvent) => {
       try {
         handlers.onProgress?.(JSON.parse(e.data) as ProgressEventPayload);
@@ -147,6 +151,14 @@ export const api = {
     });
     sse.addEventListener("cancelled", () => {
       handlers.onCancelled?.();
+    });
+    sse.addEventListener("pipeline_error", (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as { message: string };
+        handlers.onPipelineError?.(data.message ?? "unknown_error");
+      } catch (err) {
+        console.error("malformed pipeline_error event", err);
+      }
     });
     sse.onerror = (e) => handlers.onError?.(e);
     return () => sse.close();

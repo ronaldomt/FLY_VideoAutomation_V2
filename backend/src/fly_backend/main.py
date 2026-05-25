@@ -102,7 +102,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     from .behaviors.detect_card.handler import run as _detect_card
     from .context import build_default_context
     from .disk_poller import set_card_callback, start_disk_poller
-    from .http.routes import _set_last_card
+    from .http.routes import _record_card
 
     async def _on_card(mount: object, label: str | None) -> None:
         from pathlib import Path
@@ -114,7 +114,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
         ctx = build_default_context()
         detected = await _detect_card(payload, ctx)
-        _set_last_card(detected.model_dump(mode="json"))
+        _record_card(detected.model_dump(mode="json"), payload.volume_id)
 
     set_card_callback(_on_card)
     poller_task = asyncio.create_task(start_disk_poller())
@@ -123,6 +123,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # but connection_id is null (e.g. after key rotation). This makes startup
     # self-healing without requiring a UI action from the operator.
     asyncio.create_task(_recover_composio_connection(log))
+
+    # CLAUDE.md §15: resume any session left in queued/running state by a
+    # previous process. The orchestrator's idempotent ``spawn`` re-attaches
+    # the pipeline and continues from whatever phase the SQLite Phase rows
+    # say it had reached. copy_media + extract_frames + upload_to_drive are
+    # all idempotent via FileRecord rows. Wrapped in try/except so a malformed
+    # row or missing integration config never blocks the sidecar from booting.
+    from .orchestrator import orchestrator
+
+    try:
+        resumed = await orchestrator.resume_pending()
+        if resumed:
+            log.info("resumed_pending_sessions", session_ids=resumed)
+    except Exception as exc:
+        log.warning("resume_pending_failed", error=str(exc))
 
     try:
         yield

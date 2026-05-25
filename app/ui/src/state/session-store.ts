@@ -4,8 +4,8 @@
  * Customer → Destination → Ingest → Done without the URL changing.
  */
 
-import { create } from "zustand";
 import type { CustomerEvent, ProgressEvent, VerificationReport } from "@/api/types";
+import { create } from "zustand";
 
 export type SessionStep = "customer" | "ingest" | "done";
 
@@ -26,6 +26,12 @@ interface SessionStoreState {
   patch(id: string, p: Partial<SessionSlice>): void;
   setStep(id: string, step: SessionStep): void;
   appendProgress(id: string, e: ProgressEvent): void;
+  /**
+   * Replace the progress array wholesale. Called when the SSE stream
+   * (re)opens and emits its DB snapshot, so stale progress from before a
+   * disconnect doesn't accumulate or be re-counted.
+   */
+  replaceProgressSnapshot(id: string, events: ProgressEvent[]): void;
   reset(id: string): void;
 }
 
@@ -68,6 +74,17 @@ export const useSessionStore = create<SessionStoreState>((set, get) => ({
         sessions: {
           ...state.sessions,
           [id]: { ...existing, progress: [...existing.progress, e] },
+        },
+      };
+    });
+  },
+  replaceProgressSnapshot(id, events) {
+    set((state) => {
+      const existing = state.sessions[id] ?? emptySlice();
+      return {
+        sessions: {
+          ...state.sessions,
+          [id]: { ...existing, progress: events },
         },
       };
     });

@@ -7,8 +7,6 @@ Events on `GET /sessions/:id/events`.
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
 import json
 from collections.abc import AsyncIterator
 from datetime import date
@@ -18,12 +16,8 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
-from ..behaviors.copy_media.contract import CopyMediaInput
-from ..behaviors.copy_media.handler import run as copy_media
 from ..behaviors.detect_card.contract import DetectCardInput
 from ..behaviors.detect_card.handler import run as detect_card
-from ..behaviors.extract_frames.contract import ExtractFramesInput
-from ..behaviors.extract_frames.handler import run as extract_frames
 from ..behaviors.list_today_customers.contract import (
     ListTodayCustomersInput,
     ListTodayCustomersOutput,
@@ -31,12 +25,11 @@ from ..behaviors.list_today_customers.contract import (
 from ..behaviors.list_today_customers.handler import run as list_today_customers
 from ..behaviors.make_share_link.contract import MakeShareLinkInput, ShareLink
 from ..behaviors.make_share_link.handler import run as make_share_link
+from ..behaviors.progress import ProgressEvent
 from ..behaviors.resolve_drive_folder.contract import ResolveDriveFolderInput
 from ..behaviors.resolve_drive_folder.handler import run as resolve_drive_folder
 from ..behaviors.start_session.contract import SessionOut, StartSessionInput
 from ..behaviors.start_session.handler import run as start_session
-from ..behaviors.upload_to_drive.contract import UploadToDriveInput
-from ..behaviors.upload_to_drive.handler import run as upload_to_drive
 from ..behaviors.verify_upload.contract import VerificationReport, VerifyUploadInput
 from ..behaviors.verify_upload.handler import run as verify_upload
 from ..behaviors.wipe_card.contract import WipeCardInput, WipeResult
@@ -44,6 +37,7 @@ from ..behaviors.wipe_card.handler import run as wipe_card
 from ..context import build_default_context
 from ..integrations.composio_client import ensure_user_id
 from ..logging import get_logger
+from ..orchestrator import orchestrator
 from ..persistence.models import Phase, Session, SessionStatus
 from ..secrets import get_composio_key
 from ..settings import Settings, load_settings, save_settings
@@ -51,9 +45,6 @@ from . import integrations_routes
 
 router = APIRouter()
 router.include_router(integrations_routes.router)
-
-# Per-session cancel events. Keyed by session_id, populated during SSE stream.
-_cancel_events: dict[str, asyncio.Event] = {}
 
 
 def _ctx():  # type: ignore[no-untyped-def]
@@ -276,18 +267,27 @@ async def customers_today(on: date | None = None) -> ListTodayCustomersOutput:
 # ── cards ────────────────────────────────────────────────────────────────────
 
 _LAST_CARD: dict[str, object] | None = None
+_ALL_CARDS: dict[str, dict[str, object]] = {}  # keyed by volume_id
 
 
-def _set_last_card(value: dict[str, object] | None) -> None:
+def _record_card(card_dict: dict[str, object], volume_id: str) -> None:
+    """Update both the last-detected card and the all-cards map.
+
+    Called from the HTTP POST /cards/detected handler AND from the in-process
+    Python disk poller (main.py lifespan). Both must stay in sync so
+    /cards/list returns every currently-mounted card.
+    """
     global _LAST_CARD
-    _LAST_CARD = value
+    _LAST_CARD = card_dict
+    _ALL_CARDS[volume_id] = card_dict
 
 
 @router.post("/cards/detected")
 async def cards_detected(payload: DetectCardInput) -> dict[str, object]:
     detected = await detect_card(payload, _ctx())
-    _set_last_card(detected.model_dump(mode="json"))
-    return _LAST_CARD  # type: ignore[return-value]
+    card_dict = detected.model_dump(mode="json")
+    _record_card(card_dict, str(payload.volume_id))
+    return card_dict
 
 
 @router.get("/cards/current")
@@ -295,11 +295,25 @@ async def cards_current() -> dict[str, object] | None:
     return _LAST_CARD
 
 
+@router.get("/cards/list")
+async def cards_list() -> list[dict[str, object]]:
+    """Return all known cards whose mount_path still exists on disk."""
+    from pathlib import Path as _Path
+
+    return [c for c in _ALL_CARDS.values() if _Path(str(c["mount_path"])).exists()]
+
+
 # ── sessions ─────────────────────────────────────────────────────────────────
 
 @router.post("/sessions", response_model=SessionOut)
 async def sessions_create(payload: StartSessionInput) -> SessionOut:
-    return await start_session(payload, _ctx())
+    out = await start_session(payload, _ctx())
+    # Spawn the detached orchestrator task. The SSE endpoint is a pure
+    # observer; the work runs whether or not anyone is listening.
+    # Skip when start_session failed the pre-flight check (e.g. disk_full).
+    if out.status == "queued":
+        await orchestrator.spawn(out.id)
+    return out
 
 
 @router.get("/sessions/{session_id}")
@@ -337,53 +351,98 @@ async def sessions_get(session_id: str) -> dict[str, object]:
 
 @router.get("/sessions/{session_id}/events")
 async def sessions_events(session_id: str, request: Request) -> EventSourceResponse:
-    """Drives the full ingest pipeline as a Server-Sent Events stream.
+    """Observe the ingest pipeline as a Server-Sent Events stream.
 
-    Phase order: copy_media → extract_frames → upload_to_drive → verify_upload.
-    Each ProgressEvent is encoded as JSON in the SSE `data:` field. The stream
-    closes once verification completes or the session is cancelled.
+    The work itself runs in a detached orchestrator task (see
+    ``fly_backend.orchestrator``). This endpoint is a **pure observer**:
+    it emits a snapshot of current phase state from the DB so a reconnecting
+    UI doesn't appear to rewind, then forwards live events from a per-session
+    fanout queue. Disconnecting from this stream has zero effect on the
+    pipeline; reconnecting does not restart it.
+
+    Event types: ``progress`` (per phase tick), ``verification``, ``done``,
+    ``cancelled``, ``pipeline_error``. See ``app/ui/src/api/client.ts``.
     """
-    base_ctx = _ctx()
-    with base_ctx.db.session() as db:
-        if db.get(Session, session_id) is None:
-            raise HTTPException(status_code=404, detail="unknown_session")
+    from sqlmodel import select
 
-    cancel_event = asyncio.Event()
-    _cancel_events[session_id] = cancel_event
-    ctx = dataclasses.replace(base_ctx, cancel_event=cancel_event)
+    ctx = _ctx()
+    with ctx.db.session() as db:
+        sess = db.get(Session, session_id)
+        if sess is None:
+            raise HTTPException(status_code=404, detail="unknown_session")
+        snapshot_status = sess.status
+        phase_rows = db.exec(select(Phase).where(Phase.session_id == session_id)).all()
+        snapshot_events = [
+            ProgressEvent(
+                phase=p.name.value,
+                current=p.current,
+                total=p.total,
+                message=p.message,
+            )
+            for p in phase_rows
+        ]
+
+    queue = orchestrator.subscribe(session_id)
 
     async def _stream() -> AsyncIterator[dict[str, str]]:
         try:
-            for behavior, inp in (
-                (copy_media, CopyMediaInput(session_id=session_id)),
-                (extract_frames, ExtractFramesInput(session_id=session_id)),
-                (upload_to_drive, UploadToDriveInput(session_id=session_id)),
-            ):
-                async for event in behavior(inp, ctx):  # type: ignore[arg-type]
-                    if await request.is_disconnected():
-                        return
-                    yield {"event": "progress", "data": event.model_dump_json()}
-                if cancel_event.is_set():
-                    yield {"event": "cancelled", "data": json.dumps({"session_id": session_id})}
-                    return
-            # Verification is one-shot, not a stream.
-            report = await verify_upload(VerifyUploadInput(session_id=session_id), ctx)
-            yield {"event": "verification", "data": report.model_dump_json()}
+            for snap in snapshot_events:
+                yield {"event": "progress", "data": snap.model_dump_json()}
 
-            with ctx.db.session() as db:
-                sess = db.get(Session, session_id)
-                if sess is not None:
-                    sess.status = SessionStatus.completed if report.ok else SessionStatus.failed
-                    if not report.ok:
-                        sess.error = f"verification_failed: {len(report.mismatches)} mismatches"
-                    db.add(sess)
-                    db.commit()
-            yield {
-                "event": "done",
-                "data": json.dumps({"ok": report.ok, "session_id": session_id}),
-            }
+            # Terminal-state short-circuits: tell the UI to stop subscribing.
+            if snapshot_status in {SessionStatus.completed, SessionStatus.failed}:
+                yield {
+                    "event": "done",
+                    "data": json.dumps(
+                        {
+                            "ok": snapshot_status == SessionStatus.completed,
+                            "session_id": session_id,
+                        }
+                    ),
+                }
+                return
+            if snapshot_status == SessionStatus.cancelled:
+                yield {
+                    "event": "cancelled",
+                    "data": json.dumps({"session_id": session_id}),
+                }
+                return
+
+            if queue is None:
+                # Race: orchestrator finished between the snapshot read and
+                # subscribe. Re-read terminal status and emit accordingly.
+                with ctx.db.session() as db:
+                    sess2 = db.get(Session, session_id)
+                    final_status = sess2.status if sess2 else None
+                if final_status == SessionStatus.cancelled:
+                    yield {
+                        "event": "cancelled",
+                        "data": json.dumps({"session_id": session_id}),
+                    }
+                elif final_status in {
+                    SessionStatus.completed,
+                    SessionStatus.failed,
+                }:
+                    yield {
+                        "event": "done",
+                        "data": json.dumps(
+                            {
+                                "ok": final_status == SessionStatus.completed,
+                                "session_id": session_id,
+                            }
+                        ),
+                    }
+                return
+
+            terminal_events = {"done", "cancelled", "pipeline_error"}
+            while True:
+                event = await queue.get()
+                yield event
+                if event["event"] in terminal_events:
+                    return
         finally:
-            _cancel_events.pop(session_id, None)
+            if queue is not None:
+                orchestrator.unsubscribe(session_id, queue)
 
     return EventSourceResponse(_stream())
 
@@ -392,9 +451,9 @@ async def sessions_events(session_id: str, request: Request) -> EventSourceRespo
 async def sessions_cancel(session_id: str) -> dict[str, bool]:
     """Signal cancellation of a running or queued session.
 
-    Sets the in-memory cancel event (stops the SSE phase loop) and marks the
-    session cancelled in the DB. Idempotent — calling on an already-cancelled
-    session returns ok=true. Returns 409 if the session is already completed/failed.
+    Sets the orchestrator's per-session cancel event and marks the session
+    cancelled in the DB. Idempotent — calling on an already-cancelled session
+    returns ok=true. Returns 409 if the session is already completed/failed.
     """
     ctx = _ctx()
     with ctx.db.session() as db:
@@ -408,10 +467,7 @@ async def sessions_cancel(session_id: str) -> dict[str, bool]:
             db.add(sess)
             db.commit()
 
-    event = _cancel_events.get(session_id)
-    if event is not None:
-        event.set()
-
+    await orchestrator.cancel(session_id)
     return {"ok": True}
 
 
