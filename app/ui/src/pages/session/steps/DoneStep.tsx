@@ -1,12 +1,15 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { CheckCircle2, Clipboard, MessageCircle, Trash2 } from "lucide-react";
+import { CheckCircle2, Clipboard, MessageCircle, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
 import { useSessionStore } from "@/state/session-store";
 
 export function DoneStep({ sessionKey }: { sessionKey: string }) {
   const slice = useSessionStore((s) => s.sessions[sessionKey]);
   const patch = useSessionStore((s) => s.patch);
+  const reset = useSessionStore((s) => s.reset);
+  const navigate = useNavigate();
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
   const verification = slice?.verification;
@@ -129,6 +132,15 @@ export function DoneStep({ sessionKey }: { sessionKey: string }) {
             <Trash2 size={14} /> Wipe card now
           </button>
         )}
+      </div>
+      <div className="pt-2">
+        <button
+          type="button"
+          onClick={() => { reset(sessionKey); navigate("/"); }}
+          className="inline-flex items-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-sm font-medium text-emerald-950 hover:bg-emerald-400"
+        >
+          <Plus size={16} /> Start New Session
+        </button>
       </div>
     </section>
   );

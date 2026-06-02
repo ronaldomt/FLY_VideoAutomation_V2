@@ -29,6 +29,7 @@ pnpm-lock.yaml.bak
 # Tauri / Rust
 app/src-tauri/target/
 app/src-tauri/gen/
+app/src-tauri/binaries/
 
 # Build artifacts
 app/ui/dist/

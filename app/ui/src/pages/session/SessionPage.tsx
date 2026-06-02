@@ -19,9 +19,18 @@ export function SessionPage() {
   const key = sessionId ?? "draft";
   const slice = useSessionStore((s) => s.sessions[key]);
   const reset = useSessionStore((s) => s.reset);
+  const existingStep = useSessionStore((s) => s.sessions[key]?.step);
   useSessionStore((s) => s.ensure(key));
   const navigate = useNavigate();
   const [confirmCancel, setConfirmCancel] = useState(false);
+
+  // Safety net: if arriving at /session (no explicit sessionId) while the draft
+  // slot is already at "done", wipe it so the operator gets a clean start.
+  useEffect(() => {
+    if (!sessionId && existingStep === "done") {
+      reset("draft");
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const step: SessionStep = slice?.step ?? "customer";
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -94,7 +95,15 @@ async def run(payload: CopyMediaInput, ctx: Context) -> AsyncIterator[ProgressEv
             ).first()
 
         if existing is None or not dst.exists():
-            shutil.copy2(src, dst)
+            try:
+                shutil.copy2(src, dst)
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    usage = shutil.disk_usage(local_root)
+                    raise BehaviorError(
+                        f"disk_full: no space left — {usage.free:,} bytes free in {local_root}"
+                    ) from exc
+                raise
             md5 = md5_file(dst)
             with ctx.db.session() as db:
                 if existing:
